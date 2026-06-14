@@ -157,7 +157,7 @@ def _extract_strings(items, *keys) -> list:
 def _map_tde_company_full(row: dict, domain: str) -> CompanyProfile:
     """
     Map GET /intel/company/:domain full response → CompanyProfile.
-    Sections: painpoints, compete, customer, leadership.
+    Extracts identity, painpoints, compete, and customer sections.
     """
     sections = row.get("sections") or {}
     pp   = (sections.get("painpoints") or {}).get("data") or {}
@@ -199,7 +199,7 @@ def _map_tde_company_full(row: dict, domain: str) -> CompanyProfile:
         desc_parts.append("Serves: " + ", ".join(target_customers[:3]))
     description = " | ".join(desc_parts) if desc_parts else ""
 
-    # Partner programs / certifications go into research_notes
+    # Partner programs / certifications go into research_notes (shown in Panel 2)
     notes_parts = []
     if certifications:
         notes_parts.append("Partner programs & certs: " + ", ".join(certifications[:6]))
@@ -263,11 +263,11 @@ async def _tde_research_company(domain: str) -> tuple:
     """
     2-step TDE company research:
       Step 1: POST /intel/research/company  — triggers swarm if cache miss, saves rich data to DB.
-              Returns only minimal intel in the response body.
-      Step 2: GET  /intel/company/:domain   — reads full rich data from DB (all sections).
+      Step 2: GET  /intel/company/:domain   — reads full rich data (all sections) from DB.
 
     Timeout: 90s for step 1 (fresh research = 4 LLM agents + web fetch).
-    Returns: (CompanyProfile | None, buying_triggers: list)
+    Returns: (CompanyProfile | None, buying_triggers: list[str])
+    Buying triggers are stored in painpoints_data at the company level.
     """
     if not TDE_URL:
         print("[TDE] TDE_API_URL not set — skipping TDE")
@@ -302,9 +302,9 @@ async def _tde_research_company(domain: str) -> tuple:
                 print(f"[TDE] GET returned found=false for {domain}")
                 return None, []
 
+            # Extract buying triggers from painpoints section (stored at company level)
             sections = full.get("sections") or {}
             pp = (sections.get("painpoints") or {}).get("data") or {}
-            # Buying triggers live in the company's painpoints section
             buying_triggers = _extract_strings(
                 pp.get("buying_triggers") or [], "trigger", "title", "description"
             )
@@ -586,7 +586,7 @@ async def research_company(domain: str) -> ResearchResult:
                 company_profile.industry or "Technology",
                 company_profile.sub_industry or "",
             )
-            # Seed buying_triggers from company-level painpoints data if industry didn't provide them
+            # Seed buying_triggers from company painpoints if industry research didn't return any
             if industry_profile and not industry_profile.buying_triggers and company_buying_triggers:
                 industry_profile.buying_triggers = company_buying_triggers
 
