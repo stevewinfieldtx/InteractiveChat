@@ -956,10 +956,14 @@ async def _post_slack(req: NotifyHumanRequest, label: str, is_handoff: bool,
 
 
 
-# ─── Live transcript polling ──────────────────────────────────────────────────
+# ─── Live transcript (pushed from the browser SDK) ────────────────────────────
 
 class SessionRequest(BaseModel):
     conversation_id: str = ""
+
+class TranscriptTurn(BaseModel):
+    role: str = "user"      # "user" or "agent"
+    message: str = ""
 
 @app.post("/demo/session")
 async def register_session(req: SessionRequest):
@@ -974,9 +978,20 @@ async def register_session(req: SessionRequest):
     _demo_signals.clear()   # ...and prior signals so old info never carries over
     if _transcript_task and not _transcript_task.done():
         _transcript_task.cancel()
-    _transcript_task = asyncio.create_task(_poll_transcript(conv_id))
-    print(f"[transcript] Started polling for {conv_id}")
+    print(f"[session] Registered {conv_id} (live transcript via client push)")
     return {"ok": True, "conversation_id": conv_id}
+
+@app.post("/demo/transcript")
+async def add_transcript(turn: TranscriptTurn):
+    """Browser pushes each finalized turn here in real time (drives the brief + leads)."""
+    global _live_transcript
+    msg = (turn.message or "").strip()
+    if msg:
+        role = "agent" if turn.role in ("agent", "ai") else "user"
+        _live_transcript.append({"role": role, "message": msg})
+        if len(_live_transcript) > 200:
+            _live_transcript = _live_transcript[-200:]
+    return {"ok": True, "turns": len(_live_transcript)}
 
 async def _poll_transcript(conversation_id: str):
     global _live_transcript
@@ -1099,6 +1114,80 @@ async def root():
 </div>
 </body>
 </html>""")
+
+
+# Live-call script (plain string — NOT an f-string, so JS braces stay literal).
+# __AGENT_ID__ is substituted at serve time. Appended after </html> in demo_live.
+VOICE_SDK_JS = """
+<script type="module">
+import { Conversation } from "https://esm.sh/@elevenlabs/client";
+
+const AGENT_ID = "__AGENT_ID__";
+let convSession = null;
+let liveTurns = [];
+
+function setCallUI(active) {
+  const btn = document.getElementById('call-btn');
+  const st  = document.getElementById('call-state');
+  if (btn) btn.textContent = active ? '\\u23F9 End Call' : '\\uD83C\\uDFA4 Start Call';
+  if (st)  st.style.display = active ? 'inline-block' : 'none';
+  const cs = document.getElementById('chat-status');
+  if (cs)  cs.textContent = active ? 'Call in progress\\u2026' : 'Call ended.';
+}
+
+async function toggleCall() {
+  if (convSession) {
+    try { await convSession.endSession(); } catch (e) {}
+    convSession = null;
+    setCallUI(false);
+    return;
+  }
+  try {
+    await fetch('/demo/reset');            // fresh slate each call
+    liveTurns = [];
+    const b = document.getElementById('transcript-body');
+    if (b) b.innerHTML = '';
+    convSession = await Conversation.startSession({
+      agentId: AGENT_ID,
+      onConnect: (info) => {
+        const cid = (info && (info.conversationId || info.conversation_id)) || '';
+        setCallUI(true);
+        if (cid) {
+          fetch('/demo/session', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ conversation_id: cid })
+          });
+        }
+      },
+      onDisconnect: () => { convSession = null; setCallUI(false); },
+      onError: (e) => { console.error('[convai] error', e); },
+      onModeChange: (m) => {
+        const cs = document.getElementById('chat-status');
+        if (cs && m) cs.textContent = (m.mode === 'speaking') ? 'Agent speaking\\u2026' : 'Listening\\u2026';
+      },
+      onMessage: (m) => {
+        const text = (typeof m === 'string') ? m : (m && (m.message || m.text)) || '';
+        const src  = (m && (m.source || m.role)) || '';
+        if (!text) return;
+        const role = (src === 'ai' || src === 'agent') ? 'agent' : 'user';
+        liveTurns.push({ role: role, message: text });
+        if (window.renderPanel3) window.renderPanel3(liveTurns);
+        fetch('/demo/transcript', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ role: role, message: text })
+        });
+      }
+    });
+  } catch (e) {
+    console.error('[convai] start failed', e);
+    setCallUI(false);
+    const cs = document.getElementById('chat-status');
+    if (cs) cs.textContent = 'Could not start the call \\u2014 check mic permission.';
+  }
+}
+window.toggleCall = toggleCall;
+</script>
+"""
 
 
 @app.get("/demo/live", response_class=HTMLResponse)
@@ -1237,7 +1326,8 @@ async def demo_live():
 <header>
   <span class="hlogo">Guardz</span>
   <div class="hright">
-    <span class="badge live">● LIVE</span>
+    <button id="call-btn" onclick="toggleCall()" style="font-size:12px;font-weight:700;color:#fff;background:linear-gradient(135deg,#7c3aed,#4f46e5);border:none;border-radius:8px;padding:7px 16px;cursor:pointer">🎤 Start Call</button>
+    <span id="call-state" class="badge live" style="display:none">● LIVE</span>
     <button class="reset-btn" onclick="resetDemo()">Reset Demo</button>
     <a href="/" style="font-size:11px;color:#6b7280;text-decoration:none">← Home</a>
   </div>
@@ -1379,33 +1469,7 @@ async def demo_live():
 
 </div>
 
-<!-- Guardz Sales Agent Widget -->
-<elevenlabs-convai agent-id="{ELEVENLABS_AGENT_ID}"></elevenlabs-convai>
-<script src="https://elevenlabs.io/convai-widget/index.js" async type="text/javascript"></script>
-<script>
-// Capture conversation_id from widget as soon as call connects
-(function() {{
-  function tryAttach() {{
-    const w = document.querySelector('elevenlabs-convai');
-    if (!w) {{ setTimeout(tryAttach, 500); return; }}
-    // ElevenLabs widget fires these events on the element
-    ['elevenlabs-convai:connect','elevenlabs-convai:call_started','connect'].forEach(evt => {{
-      w.addEventListener(evt, function(e) {{
-        const cid = (e.detail && (e.detail.conversation_id || e.detail.conversationId)) || '';
-        if (cid) {{
-          console.log('[transcript] conversation_id:', cid);
-          fetch('/demo/session', {{
-            method: 'POST',
-            headers: {{'Content-Type':'application/json'}},
-            body: JSON.stringify({{conversation_id: cid}})
-          }});
-        }}
-      }});
-    }});
-  }}
-  tryAttach();
-}})();
-</script>
+<!-- Voice call is driven by the ElevenLabs JS SDK (module script appended after </html>) -->
 
 <script>
 let lastJobStatus = null;
@@ -1523,12 +1587,6 @@ function renderResearch(job) {{
         ${{trends.map(t => `<span class="tag" style="background:rgba(245,158,11,.08);color:#f59e0b;border-color:rgba(245,158,11,.2)">${{t}}</span>`).join('')}}
       </div>` : ''}}
 
-      ${{sc.context_note ? `
-      <div class="section">
-        <div class="section-label">Agent Context Note</div>
-        <div class="context-note">${{sc.context_note}}</div>
-      </div>` : ''}}
-
       ${{job.duration_seconds ? `<div class="duration">Research completed in ${{job.duration_seconds}}s</div>` : ''}}
     `;
     return;
@@ -1540,45 +1598,22 @@ function renderResearch(job) {{
   }}
 }}
 
-function renderPanel3(transcript, signals) {{
+function renderPanel3(transcript) {{
   const body = document.getElementById('transcript-body');
   const status = document.getElementById('transcript-status');
   if (!body) return;
+  if (!transcript || transcript.length === 0) return;
 
-  const hasTx = transcript && transcript.length > 0;
-  const hasSig = signals && signals.length > 0;
-
-  if (!hasTx && !hasSig) return;
-
-  // Map signals to a simple list for callout rendering
-  const sigList = signals || [];
-
-  let html = '';
-
-  if (hasTx) {{
-    status.textContent = '📝 Live Transcript — ' + transcript.length + ' turns';
-    html += transcript.map(turn => {{
-      const isAgent = turn.role === 'agent';
-      const label = isAgent ? '🤖 Guardz Agent' : '👤 Caller';
-      const cls = isAgent ? 'agent' : 'user';
-      return `<div class="tx-turn tx-turn-${{cls}}">
-        <div class="tx-label tx-label-${{cls}}">${{label}}</div>
-        <div class="tx-bubble tx-bubble-${{cls}}">${{turn.message || ''}}</div>
-      </div>`;
-    }}).join('');
-  }}
-
-  if (hasSig) {{
-    html += sigList.map(s => `
-      <div class="tx-signal">
-        <span class="tx-signal-icon">🔔</span>
-        <strong>${{s.label || s.signal_type}}</strong>
-        ${{s.message ? ` — "${{s.message}}"` : ''}}
-        <span style="float:right;color:#4b5563;font-size:10px">${{fmtTime(s.timestamp)}}</span>
-      </div>`).join('');
-  }}
-
-  body.innerHTML = html;
+  status.textContent = '📝 Live Transcript — ' + transcript.length + ' turns';
+  body.innerHTML = transcript.map(turn => {{
+    const isAgent = turn.role === 'agent';
+    const label = isAgent ? '🤖 Agent' : '👤 Caller';
+    const cls = isAgent ? 'agent' : 'user';
+    return `<div class="tx-turn tx-turn-${{cls}}">
+      <div class="tx-label tx-label-${{cls}}">${{label}}</div>
+      <div class="tx-bubble tx-bubble-${{cls}}">${{turn.message || ''}}</div>
+    </div>`;
+  }}).join('');
   body.scrollTop = body.scrollHeight;
 }}
 
@@ -1593,12 +1628,7 @@ async function poll() {{
     if (data.jobs && data.jobs.length > 0) {{
       renderResearch(data.jobs[0]);
     }}
-    const transcript = data.transcript || [];
-    const signals = data.signals || [];
-    if (transcript.length > 0 || signals.length > lastSignalCount) {{
-      lastSignalCount = signals.length;
-      renderPanel3(transcript, signals);
-    }}
+    // Panel 3 (transcript) is painted live by the SDK onMessage handler, not here.
   }} catch(e) {{ /* ignore */ }}
 }}
 
@@ -1625,4 +1655,4 @@ async function resetDemo() {{
 setInterval(poll, 2000);
 </script>
 </body>
-</html>""")
+</html>""" + VOICE_SDK_JS.replace("__AGENT_ID__", ELEVENLABS_AGENT_ID))
