@@ -1090,9 +1090,9 @@ async def root():
     Launch Demo
   </button>
   <div class="pills">
-    <span class="pill">Live company research</span>
+    <span class="pill">Live customer research</span>
     <span class="pill">Real-time signals</span>
-    <span class="pill">Auto transfer to human</span>
+    <span class="pill">Instant human callback</span>
   </div>
 </div>
 </body>
@@ -1356,7 +1356,7 @@ async def demo_live():
     <div class="panel-body" id="research-body">
       <div class="waiting">
         <div class="waiting-icon">🔬</div>
-        <div class="waiting-text">Research starts automatically<br>once the agent collects your email</div>
+        <div class="waiting-text">Research starts automatically<br>once the agent learns which customers you serve</div>
       </div>
     </div>
   </div>
