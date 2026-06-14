@@ -1066,6 +1066,7 @@ class ChatMessage(BaseModel):
     session_id: str = "copilot"
     role: str = "customer"   # "customer" or "rep"
     message: str = ""
+    simulate: bool = False   # demo only: AI plays the customer. LIVE leaves this false (real visitor).
 
 
 async def _generate_copilot(messages: list) -> dict:
@@ -1252,10 +1253,11 @@ async def chat_send(msg: ChatMessage, background_tasks: BackgroundTasks):
     chat["messages"].append({"role": role, "text": text, "ts": datetime.utcnow().isoformat()})
     if len(chat["messages"]) > 100:
         chat["messages"] = chat["messages"][-100:]
-    if role == "rep":
-        # Rep spoke → AI customer responds to THEM, then coach on the exchange.
+    if role == "rep" and msg.simulate:
+        # DEMO: AI plays the customer and responds to the rep, then coach.
         background_tasks.add_task(_customer_then_coach, sid)
     else:
+        # LIVE: real visitor on the other end — just coach the rep (no AI customer).
         background_tasks.add_task(_run_copilot, sid)
     return {"ok": True, "count": len(chat["messages"])}
 
@@ -1284,6 +1286,105 @@ async def chat_suggest_rep(session_id: str = "copilot"):
     """Draft a rep reply for the human to edit before sending ('Respond for me')."""
     chat = _chats.get(session_id, {"messages": []})
     return {"suggestion": await _generate_rep_reply(chat.get("messages", []))}
+
+
+# ─── Public Guardz-page chat (Phase 1: AI answers; Phase 2 seam: human + coaching) ──
+
+class GuardzChatRequest(BaseModel):
+    session_id: str = ""
+    message: str = ""
+
+
+async def _generate_guardz_reply(messages: list) -> str:
+    """Friendly Guardz expert answering a website visitor on the Guardz page."""
+    if not OPENROUTER_API_KEY:
+        return "Thanks for stopping by! The assistant is warming up — try again in a moment."
+    import httpx
+    convo = "\n".join(
+        f"{'VISITOR' if m.get('role') == 'customer' else 'YOU'}: {m.get('text','')}"
+        for m in messages[-20:]
+    )
+    prompt = (
+        "You are a friendly, sharp Guardz expert at Rain Networks, chatting with a visitor on the "
+        "Guardz product page. The visitor is usually an IT reseller / MSP weighing whether to offer "
+        "Guardz to their SMB clients. Answer clearly and concisely — 1-3 short, conversational "
+        "sentences, never an info-dump. Be helpful first. Naturally learn what they sell and who their "
+        "clients are so you can make it relevant. When the moment feels right, offer to have a "
+        "specialist follow up and ask for their email — don't force it early.\n\n"
+        "GUARDZ FACTS: all-in-one cybersecurity + cyber insurance platform for MSPs/resellers serving "
+        "SMBs — email security, EDR (SentinelOne), identity threat detection, cloud security "
+        "(M365/Google), security awareness training, phishing simulation, and external footprint "
+        "scanning, in one multi-tenant console. Free Community tier; Pro and Ultimate per-user/mo "
+        "(Ultimate includes SentinelOne MDR); no enterprise commitment. 2025 MSP Today Product of the "
+        "Year; $56M Series B. Partners typically add it at $5-15/user on existing contracts.\n\n"
+        "If asked, you're the Guardz AI assistant for Rain Networks (don't claim to be human). "
+        "Output ONLY your next reply.\n\n"
+        f"CONVERSATION:\n{convo if convo else '(the visitor just opened the chat — greet them warmly and ask what brought them in)'}"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                         "HTTP-Referer": "https://interactivechat.up.railway.app",
+                         "X-Title": "Rain Networks Guardz"},
+                json={"model": OPENROUTER_MODEL, "messages": [{"role": "user", "content": prompt}],
+                      "max_tokens": 220, "temperature": 0.5},
+            )
+        if resp.status_code == 200:
+            return resp.json()["choices"][0]["message"]["content"].strip().strip('"')
+        print(f"[guardz-chat] OpenRouter {resp.status_code}: {resp.text[:160]}")
+    except Exception as e:
+        print(f"[guardz-chat] error: {e}")
+    return "Sorry — I hit a snag. Mind trying that again?"
+
+
+async def _guardz_capture(sid: str):
+    """Capture a lead when the visitor shares an email, and notify the team once."""
+    chat = _chats.get(sid)
+    if not chat:
+        return
+    msgs = chat.get("messages", [])
+    email = _extract_email(_transcript_text(msgs))
+    if not email:
+        return
+    st = _handoff_state.setdefault(sid, {})
+    if st.get("notified"):
+        return
+    st["notified"] = True
+    await _save_lead(session_id=sid, name="", company="", email=email, phone="",
+                     vertical="", signal="web_guardz_chat", handed_off=False,
+                     brief="", transcript=msgs)
+    import html as _h
+    lines = "".join(
+        f"<div style='margin:4px 0'><b>{'Visitor' if m.get('role')=='customer' else 'Guardz AI'}:</b> "
+        f"{_h.escape(m.get('text',''))}</div>" for m in msgs[-14:]
+    )
+    body = (f"<div style=\"font-family:-apple-system,Segoe UI,sans-serif;color:#1f2937\">"
+            f"<h3>New Guardz-page chat lead</h3><p><b>Email:</b> {_h.escape(email)}</p><hr>{lines}</div>")
+    ok, detail = await send_email(SALES_TEAM_EMAIL, f"🌐 Guardz page lead — {email}", body)
+    print(f"[guardz-chat] lead {email} -> {SALES_TEAM_EMAIL}: ok={ok} ({detail})")
+
+
+@app.post("/guardz/chat")
+async def guardz_chat(req: GuardzChatRequest, background_tasks: BackgroundTasks):
+    """Public Guardz-page chat. Phase 1: AI answers. Phase 2 seam: if a human rep claims this
+    session (chat['human_active']=True), the AI stays silent and the rep answers with coaching."""
+    sid = "guardz:" + ((req.session_id or "web").strip() or "web")
+    chat = _chats.setdefault(sid, {"messages": [], "coach": {}})
+    msg = (req.message or "").strip()
+    if msg:
+        chat["messages"].append({"role": "customer", "text": msg, "ts": datetime.utcnow().isoformat()})
+        if len(chat["messages"]) > 100:
+            chat["messages"] = chat["messages"][-100:]
+    if chat.get("human_active"):   # Phase 2: a human has the wheel — don't auto-answer.
+        background_tasks.add_task(_guardz_capture, sid)
+        return {"reply": "", "pending_human": True}
+    reply = await _generate_guardz_reply(chat["messages"])
+    if reply:
+        chat["messages"].append({"role": "agent", "text": reply, "ts": datetime.utcnow().isoformat()})
+    background_tasks.add_task(_guardz_capture, sid)
+    return {"reply": reply, "pending_human": False}
 
 async def _poll_transcript(conversation_id: str):
     global _live_transcript
@@ -1479,7 +1580,7 @@ async function startDemo(){
 async function send(role){
   const inp=document.getElementById('rep-in');
   const t=(inp.value||'').trim(); if(!t)return; inp.value='';
-  await fetch('/chat/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:SID,role:role||'rep',message:t})});
+  await fetch('/chat/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:SID,role:role||'rep',message:t,simulate:true})});
   poll();
 }
 async function suggestRep(){
@@ -1523,6 +1624,97 @@ setInterval(poll,1500); poll();
 @app.get("/copilot", response_class=HTMLResponse)
 async def copilot_page():
     return HTMLResponse(COPILOT_PAGE)
+
+
+# Rep console — a human answers a LIVE visitor with AI coaching (no AI customer).
+AGENT_PAGE = """<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Rain Networks — Agent Console</title>
+<style>
+ * { box-sizing:border-box; margin:0; padding:0 }
+ html,body { height:100%; background:#080818; color:#fff; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif }
+ header { height:50px; background:#0d0d24; border-bottom:1px solid rgba(255,255,255,.07); display:flex; align-items:center; justify-content:space-between; padding:0 20px }
+ .hlogo { font-size:14px; font-weight:700; color:#a78bfa; letter-spacing:.1em; text-transform:uppercase }
+ .sess { font-size:11px; color:#6b7280 }
+ .wrap { display:grid; grid-template-columns:1fr 360px; height:calc(100vh - 50px); gap:1px; background:rgba(255,255,255,.05) }
+ .col { background:#0d0d24; display:flex; flex-direction:column; overflow:hidden }
+ .col-h { padding:12px 16px; border-bottom:1px solid rgba(255,255,255,.06); font-size:11px; font-weight:700; letter-spacing:.1em; text-transform:uppercase; color:#6b7280 }
+ .msgs { flex:1; overflow-y:auto; padding:14px; display:flex; flex-direction:column; gap:8px }
+ .b { max-width:85%; padding:8px 12px; border-radius:10px; font-size:13px; line-height:1.5 }
+ .b.customer { align-self:flex-start; background:rgba(16,185,129,.13); border:1px solid rgba(16,185,129,.32); color:#a7f3d0 }
+ .b.rep { align-self:flex-end; background:rgba(167,139,250,.16); border:1px solid rgba(167,139,250,.34); color:#ddd6fe }
+ .inrow { display:flex; gap:8px; padding:12px; border-top:1px solid rgba(255,255,255,.06) }
+ .inrow input { flex:1; background:rgba(255,255,255,.05); border:1px solid rgba(255,255,255,.1); border-radius:8px; padding:9px 12px; color:#fff; font-size:13px; outline:none }
+ .inrow button { background:linear-gradient(135deg,#7c3aed,#4f46e5); border:none; border-radius:8px; color:#fff; font-size:13px; font-weight:700; padding:9px 14px; cursor:pointer }
+ .cop { background:#0d0d24; padding:16px; overflow-y:auto }
+ .light { display:flex; align-items:center; gap:14px; margin-bottom:18px }
+ .dot { width:52px; height:52px; border-radius:50%; background:#374151; transition:all .3s }
+ .dot.green { background:#10b981; box-shadow:0 0 26px rgba(16,185,129,.6) }
+ .dot.yellow { background:#f59e0b; box-shadow:0 0 26px rgba(245,158,11,.6) }
+ .dot.red { background:#ef4444; box-shadow:0 0 26px rgba(239,68,68,.6) }
+ .lt { font-size:13px; color:#94a3b8 } .lt b { display:block; font-size:18px; color:#e2e8f0; text-transform:capitalize }
+ .sec { margin-top:16px } .sec-l { font-size:10px; font-weight:700; letter-spacing:.1em; text-transform:uppercase; color:#4b5563; margin-bottom:6px }
+ .tone { font-size:14px; color:#c4b5fd } .sug { font-size:13px; color:#f1f5f9 }
+ .bar { height:6px; background:rgba(255,255,255,.08); border-radius:3px; overflow:hidden; margin-top:6px } .bar > i { display:block; height:100%; background:linear-gradient(90deg,#7c3aed,#10b981); width:0%; transition:width .3s }
+</style></head>
+<body>
+<header>
+ <span class="hlogo">Rain Networks &middot; Agent Console</span>
+ <span class="sess">session: <b id="sesslabel"></b></span>
+</header>
+<div class="wrap">
+ <div class="col">
+   <div class="col-h">Live chat &mdash; <span style="color:#a7f3d0">visitor</span> &middot; <span style="color:#c4b5fd">you (rep)</span></div>
+   <div class="msgs" id="convo-msgs"></div>
+   <div class="inrow"><input id="rep-in" placeholder="Answer the visitor..." onkeydown="if(event.key==='Enter')send()"><button id="respbtn" onclick="suggestRep()" style="background:rgba(124,58,237,.18);border:1px solid rgba(124,58,237,.45);color:#c4b5fd;font-weight:600">Respond for me</button><button onclick="send()">Send</button></div>
+ </div>
+ <div class="cop">
+   <div class="col-h" style="padding:0 0 12px">AI Copilot</div>
+   <div class="light"><div class="dot" id="dot"></div><div class="lt">Call health<b id="health">&mdash;</b></div></div>
+   <div class="sec"><div class="sec-l">Intent</div><div id="intent" class="lt">&mdash;</div><div class="bar"><i id="intentbar"></i></div></div>
+   <div class="sec"><div class="sec-l">Tone / intent read</div><div class="tone" id="tone">Waiting for the visitor...</div></div>
+   <div class="sec"><div class="sec-l">Coaching nudge</div><div class="sug" id="sug">&mdash;</div></div>
+ </div>
+</div>
+<script>
+const SID=(new URLSearchParams(location.search)).get('session')||'guardz-live';
+document.getElementById('sesslabel').textContent=SID;
+function esc(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function renderMsgs(el,msgs){ el.innerHTML=msgs.map(m=>'<div class="b '+(m.role==='customer'?'customer':'rep')+'">'+esc(m.text)+'</div>').join(''); el.scrollTop=el.scrollHeight; }
+function setCoach(c){
+  const h=c.health||''; const dot=document.getElementById('dot'); dot.className='dot'+(h?(' '+h):'');
+  document.getElementById('health').textContent=h||'\\u2014';
+  document.getElementById('intent').textContent=(c.intent!=null?c.intent+'%':'\\u2014');
+  document.getElementById('intentbar').style.width=(c.intent!=null?c.intent:0)+'%';
+  document.getElementById('tone').textContent=c.tone||'Waiting for the visitor...';
+  const tips=c.tips||(c.suggestion?[c.suggestion]:[]);
+  document.getElementById('sug').innerHTML = tips.length ? ('<ul style="margin:0;padding-left:18px">'+tips.map(t=>'<li style="margin:4px 0">'+esc(t)+'</li>').join('')+'</ul>') : '\\u2014';
+}
+async function send(){
+  const inp=document.getElementById('rep-in'); const t=(inp.value||'').trim(); if(!t)return; inp.value='';
+  await fetch('/chat/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:SID,role:'rep',message:t})});
+  poll();
+}
+async function suggestRep(){
+  const inp=document.getElementById('rep-in'); const btn=document.getElementById('respbtn');
+  const old=btn.innerHTML; btn.innerHTML='Drafting...'; btn.disabled=true;
+  try{ const r=await fetch('/chat/suggest-rep?session_id='+encodeURIComponent(SID),{method:'POST'}); const d=await r.json(); if(d&&d.suggestion){ inp.value=d.suggestion; inp.focus(); } }catch(e){}
+  btn.innerHTML=old; btn.disabled=false;
+}
+async function poll(){
+  try{ const r=await fetch('/chat/state?session_id='+encodeURIComponent(SID)); const d=await r.json();
+    renderMsgs(document.getElementById('convo-msgs'), d.messages||[]); setCoach(d.coach||{});
+  }catch(e){}
+}
+setInterval(poll,1500); poll();
+</script>
+</body></html>"""
+
+
+@app.get("/agent", response_class=HTMLResponse)
+async def agent_console():
+    return HTMLResponse(AGENT_PAGE)
 
 
 # Live-call script (plain string — NOT an f-string, so JS braces stay literal).
