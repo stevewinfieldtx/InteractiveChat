@@ -142,6 +142,25 @@ async def _save_industry(pool, i) -> int:
 
 # ─── Background research ──────────────────────────────────────────────────────
 
+async def _run_research_job_no_db(domain: str, session_id: str):
+    """Run research without database — demo/no-DB-URL mode."""
+    try:
+        result: ResearchResult = await research_company(domain)
+        sc = result.sales_context
+        _upsert_demo_job(
+            session_id,
+            status="done",
+            domain=domain,
+            company=result.company.model_dump(),
+            industry=result.industry.model_dump(),
+            sales_context=sc.model_dump() if sc else None,
+            duration_seconds=result.duration_seconds,
+        )
+    except Exception as e:
+        _upsert_demo_job(session_id, status="failed", error=str(e))
+        print(f"[research] Failed for {domain}: {e}")
+
+
 async def _run_research_job(job_id: int, domain: str, session_id: str):
     pool = await get_pool()
     await pool.execute(
@@ -185,9 +204,7 @@ async def start_research(req: ResearchRequest, background_tasks: BackgroundTasks
     if not domain:
         raise HTTPException(status_code=400, detail="Provide a 'domain' or business 'email'.")
 
-    pool = await get_pool()
-
-    # Track in demo state immediately
+    # Track in demo state immediately (before any DB ops)
     _upsert_demo_job(
         req.session_id,
         domain=domain,
@@ -195,6 +212,13 @@ async def start_research(req: ResearchRequest, background_tasks: BackgroundTasks
         started_at=datetime.utcnow().isoformat(),
         company=None, industry=None, sales_context=None,
     )
+
+    # No DB configured — run research directly without caching
+    if not DATABASE_URL:
+        background_tasks.add_task(_run_research_job_no_db, domain, req.session_id)
+        return ResearchStatusResponse(session_id=req.session_id, domain=domain, status="pending")
+
+    pool = await get_pool()
 
     if not req.force_refresh:
         cached = await _get_cached_company(pool, domain)
