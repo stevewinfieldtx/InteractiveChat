@@ -2,6 +2,7 @@
 api.py — Guardz Research Agent + Live Demo
 """
 
+import asyncio
 import os
 from datetime import datetime
 
@@ -18,11 +19,15 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 ELEVENLABS_AGENT_ID = os.getenv("ELEVENLABS_AGENT_ID", "agent_5101kty2ztmme25aspqycwp7mpsm")
+ELEVENLABS_API_KEY  = os.getenv("ELEVENLABS_API_KEY", "")
 
 # ─── Demo state (in-memory, resets on redeploy) ───────────────────────────────
 
 _demo_jobs: list[dict] = []   # most-recent first, max 10
 _demo_signals: list[dict] = []
+_live_transcript: list[dict] = []
+_active_conv_id: str = ""
+_transcript_task: asyncio.Task | None = None
 
 def _upsert_demo_job(session_id: str, **fields):
     for job in _demo_jobs:
@@ -398,16 +403,69 @@ async def notify_human(req: NotifyHumanRequest):
         return NotifyHumanResponse(ok=False, detail=str(e))
 
 
+
+# ─── Live transcript polling ──────────────────────────────────────────────────
+
+class SessionRequest(BaseModel):
+    conversation_id: str = ""
+
+@app.post("/demo/session")
+async def register_session(req: SessionRequest):
+    global _active_conv_id, _live_transcript, _transcript_task
+    conv_id = req.conversation_id.strip()
+    if not conv_id or conv_id == _active_conv_id:
+        return {"ok": True, "detail": "no change"}
+    _active_conv_id = conv_id
+    _live_transcript = []
+    if _transcript_task and not _transcript_task.done():
+        _transcript_task.cancel()
+    _transcript_task = asyncio.create_task(_poll_transcript(conv_id))
+    print(f"[transcript] Started polling for {conv_id}")
+    return {"ok": True, "conversation_id": conv_id}
+
+async def _poll_transcript(conversation_id: str):
+    global _live_transcript
+    if not ELEVENLABS_API_KEY:
+        print("[transcript] No ELEVENLABS_API_KEY")
+        return
+    import httpx
+    url = f"https://api.elevenlabs.io/v1/convai/conversations/{conversation_id}"
+    headers = {"xi-api-key": ELEVENLABS_API_KEY}
+    try:
+        for _ in range(400):
+            await asyncio.sleep(3)
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                resp = await client.get(url, headers=headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                turns = data.get("transcript", [])
+                if turns:
+                    _live_transcript = turns
+                if data.get("status") == "done":
+                    print(f"[transcript] Conv {conversation_id} done")
+                    break
+            else:
+                print(f"[transcript] {resp.status_code} for {conversation_id}")
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        print(f"[transcript] Error: {e}")
+
 # ─── Demo state API ───────────────────────────────────────────────────────────
 
 @app.get("/demo/state")
 async def demo_state():
-    return {"jobs": _demo_jobs, "signals": _demo_signals}
+    return {"jobs": _demo_jobs, "signals": _demo_signals, "transcript": _live_transcript}
 
 @app.get("/demo/reset")
 async def demo_reset():
+    global _active_conv_id, _live_transcript, _transcript_task
     _demo_jobs.clear()
     _demo_signals.clear()
+    _live_transcript.clear()
+    _active_conv_id = ""
+    if _transcript_task and not _transcript_task.done():
+        _transcript_task.cancel()
     return {"ok": True}
 
 
@@ -576,6 +634,28 @@ async def demo_live():
     animation:slidein .3s ease
   }}
   .transfer-alert .signal-label {{ color:#10b981 }}
+
+  /* ── Transcript panel ── */
+  .tx-turn {{ margin-bottom:12px; animation:slidein .25s ease }}
+  .tx-turn-agent {{ padding-left:0 }}
+  .tx-turn-user  {{ padding-left:0 }}
+  .tx-label {{ font-size:10px; font-weight:700; letter-spacing:.08em;
+    text-transform:uppercase; margin-bottom:4px }}
+  .tx-label-agent {{ color:#7c3aed }}
+  .tx-label-user  {{ color:#0ea5e9 }}
+  .tx-bubble {{ font-size:13px; line-height:1.6; padding:10px 14px;
+    border-radius:10px; word-break:break-word }}
+  .tx-bubble-agent {{ background:rgba(124,58,237,.1); color:#ddd6fe;
+    border:1px solid rgba(124,58,237,.2) }}
+  .tx-bubble-user  {{ background:rgba(14,165,233,.08); color:#bae6fd;
+    border:1px solid rgba(14,165,233,.15) }}
+  .tx-signal {{ background:rgba(16,185,129,.08); border:1px solid rgba(16,185,129,.25);
+    border-radius:8px; padding:8px 12px; margin:10px 0;
+    font-size:12px; color:#6ee7b7; line-height:1.5 }}
+  .tx-signal-icon {{ margin-right:6px }}
+  .tx-empty {{ text-align:center; padding:40px 0 }}
+  .tx-empty-icon {{ font-size:28px; margin-bottom:10px }}
+  .tx-empty-text {{ font-size:12px; color:#374151 }}
 </style>
 </head>
 <body>
@@ -709,16 +789,16 @@ async def demo_live():
     </div>
   </div>
 
-  <!-- Panel 3: Live Intel -->
+  <!-- Panel 3: Live Transcript -->
   <div class="panel">
     <div class="panel-head">
       <div class="panel-title">Panel 3</div>
-      <div class="panel-status">🔔 Live Sales Intel</div>
+      <div class="panel-status" id="transcript-status">📝 Live Transcript</div>
     </div>
-    <div class="panel-body" id="signals-body">
-      <div class="no-signals">
-        <div class="no-signals-icon">🔔</div>
-        <div class="no-signals-text">Signals appear here when the prospect<br>shows buying intent or requests a demo</div>
+    <div class="panel-body" id="transcript-body">
+      <div class="tx-empty">
+        <div class="tx-empty-icon">📝</div>
+        <div class="tx-empty-text">Transcript builds here<br>as the conversation unfolds</div>
       </div>
     </div>
   </div>
@@ -728,6 +808,30 @@ async def demo_live():
 <!-- Guardz Sales Agent Widget -->
 <elevenlabs-convai agent-id="{ELEVENLABS_AGENT_ID}"></elevenlabs-convai>
 <script src="https://elevenlabs.io/convai-widget/index.js" async type="text/javascript"></script>
+<script>
+// Capture conversation_id from widget as soon as call connects
+(function() {{
+  function tryAttach() {{
+    const w = document.querySelector('elevenlabs-convai');
+    if (!w) {{ setTimeout(tryAttach, 500); return; }}
+    // ElevenLabs widget fires these events on the element
+    ['elevenlabs-convai:connect','elevenlabs-convai:call_started','connect'].forEach(evt => {{
+      w.addEventListener(evt, function(e) {{
+        const cid = (e.detail && (e.detail.conversation_id || e.detail.conversationId)) || '';
+        if (cid) {{
+          console.log('[transcript] conversation_id:', cid);
+          fetch('/demo/session', {{
+            method: 'POST',
+            headers: {{'Content-Type':'application/json'}},
+            body: JSON.stringify({{conversation_id: cid}})
+          }});
+        }}
+      }});
+    }});
+  }}
+  tryAttach();
+}})();
+</script>
 
 <script>
 let lastJobStatus = null;
@@ -862,22 +966,50 @@ function renderResearch(job) {{
   }}
 }}
 
+function renderPanel3(transcript, signals) {{
+  const body = document.getElementById('transcript-body');
+  const status = document.getElementById('transcript-status');
+  if (!body) return;
+
+  const hasTx = transcript && transcript.length > 0;
+  const hasSig = signals && signals.length > 0;
+
+  if (!hasTx && !hasSig) return;
+
+  // Map signals to a simple list for callout rendering
+  const sigList = signals || [];
+
+  let html = '';
+
+  if (hasTx) {{
+    status.textContent = '📝 Live Transcript — ' + transcript.length + ' turns';
+    html += transcript.map(turn => {{
+      const isAgent = turn.role === 'agent';
+      const label = isAgent ? '🤖 Guardz Agent' : '👤 Caller';
+      const cls = isAgent ? 'agent' : 'user';
+      return `<div class="tx-turn tx-turn-${{cls}}">
+        <div class="tx-label tx-label-${{cls}}">${{label}}</div>
+        <div class="tx-bubble tx-bubble-${{cls}}">${{turn.message || ''}}</div>
+      </div>`;
+    }}).join('');
+  }}
+
+  if (hasSig) {{
+    html += sigList.map(s => `
+      <div class="tx-signal">
+        <span class="tx-signal-icon">🔔</span>
+        <strong>${{s.label || s.signal_type}}</strong>
+        ${{s.message ? ` — "${{s.message}}"` : ''}}
+        <span style="float:right;color:#4b5563;font-size:10px">${{fmtTime(s.timestamp)}}</span>
+      </div>`).join('');
+  }}
+
+  body.innerHTML = html;
+  body.scrollTop = body.scrollHeight;
+}}
+
 function renderSignals(signals) {{
-  const body = document.getElementById('signals-body');
-  if (!signals || signals.length === 0) return;
-
-  const isTransfer = s => ['demo_agreed','handoff_requested','strong_interest'].includes(s.signal_type);
-
-  body.innerHTML = signals.map(s => `
-    <div class="${{isTransfer(s) ? 'transfer-alert' : 'signal-card'}}">
-      <div class="signal-label">${{s.label || s.signal_type}}</div>
-      <div class="signal-who">
-        ${{s.prospect_name || 'Prospect'}}${{s.company_name ? ' · ' + s.company_name : ''}}
-      </div>
-      ${{s.message ? `<div class="signal-quote">"${{s.message}}"</div>` : ''}}
-      ${{isTransfer(s) ? `<div style="font-size:12px;color:#10b981;margin-top:8px;font-weight:600">📞 Transferring to +14257538897</div>` : ''}}
-      <div class="signal-time">${{fmtTime(s.timestamp)}}</div>
-    </div>`).join('');
+  // Kept for compatibility — now routed through renderPanel3
 }}
 
 async function poll() {{
@@ -887,9 +1019,11 @@ async function poll() {{
     if (data.jobs && data.jobs.length > 0) {{
       renderResearch(data.jobs[0]);
     }}
-    if (data.signals && data.signals.length !== lastSignalCount) {{
-      lastSignalCount = data.signals.length;
-      renderSignals(data.signals);
+    const transcript = data.transcript || [];
+    const signals = data.signals || [];
+    if (transcript.length > 0 || signals.length > lastSignalCount) {{
+      lastSignalCount = signals.length;
+      renderPanel3(transcript, signals);
     }}
   }} catch(e) {{ /* ignore */ }}
 }}
@@ -904,11 +1038,13 @@ async function resetDemo() {{
       <div class="waiting-icon">🔬</div>
       <div class="waiting-text">Research starts automatically<br>once the agent collects your email</div>
     </div>`;
-  document.getElementById('signals-body').innerHTML = `
-    <div class="no-signals">
-      <div class="no-signals-icon">🔔</div>
-      <div class="no-signals-text">Signals appear here when the prospect<br>shows buying intent or requests a demo</div>
+  document.getElementById('transcript-body').innerHTML = `
+    <div class="tx-empty">
+      <div class="tx-empty-icon">📝</div>
+      <div class="tx-empty-text">Transcript builds here<br>as the conversation unfolds</div>
     </div>`;
+  if (document.getElementById('transcript-status'))
+    document.getElementById('transcript-status').textContent = '📝 Live Transcript';
   document.getElementById('chat-status').textContent = 'Waiting for conversation to start…';
 }}
 
