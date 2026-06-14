@@ -20,6 +20,8 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 ELEVENLABS_AGENT_ID = os.getenv("ELEVENLABS_AGENT_ID", "agent_5101kty2ztmme25aspqycwp7mpsm")
 ELEVENLABS_API_KEY  = os.getenv("VITE_ELEVENLABS_API_KEY", os.getenv("ELEVENLABS_API_KEY", ""))
+OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL    = os.getenv("OPENROUTER_MODEL", "anthropic/claude-haiku-4-5")
 
 # ─── Demo state (in-memory, resets on redeploy) ───────────────────────────────
 
@@ -357,6 +359,93 @@ class NotifyHumanResponse(BaseModel):
     ok: bool
     detail: str = ""
 
+
+async def _generate_sales_brief(
+    transcript: list, company: dict, sales_context: dict,
+    prospect_name: str, company_name: str
+) -> str:
+    """Call OpenRouter to produce a structured sales brief for Chad."""
+    if not OPENROUTER_API_KEY or not transcript:
+        return ""
+    import httpx
+
+    tx_lines = []
+    for t in transcript:
+        role = "AGENT" if t.get("role") == "agent" else "CALLER"
+        tx_lines.append(f"{role}: {t.get('message','').strip()}")
+    tx_text = "\n".join(tx_lines)
+
+    co = company or {}
+    ctx = sales_context or {}
+    company_ctx = ""
+    if co.get("company_name"):
+        company_ctx = (
+            f"Company: {co.get('company_name')} | "
+            f"Industry: {co.get('industry','')} | "
+            f"Size: {co.get('company_size','')} | "
+            f"Location: {co.get('hq_location','')}\n"
+            f"Description: {(co.get('description') or '')[:250]}"
+        )
+    pains = ", ".join((ctx.get("pain_points") or [])[:3])
+    triggers = ", ".join((ctx.get("buying_triggers") or [])[:3])
+    if pains:
+        company_ctx += f"\nKnown pain points: {pains}"
+    if triggers:
+        company_ctx += f"\nBuying triggers: {triggers}"
+
+    prompt = f"""You are a sales intelligence analyst briefing Chad, a human closer at Guardz, who is about to call a prospect right now. Be specific to THIS conversation. No generic advice.
+
+PROSPECT: {prospect_name or "Unknown"} at {company_name or "Unknown"}
+{company_ctx}
+
+TRANSCRIPT:
+{tx_text}
+
+Respond in exactly this format (keep each section tight):
+
+HIGHLIGHTS
+• [most important thing revealed]
+• [second most important]
+• [third — only if genuinely distinct]
+
+INTENT SCORE
+[number 0-100]% — [one sentence: what signals drove this score]
+
+DIRECTION
+[1-2 sentences: where is this prospect in the journey and what are they about to do]
+
+BIGGEST CONCERN
+[The single clearest objection, worry, or blocker — quote their words if possible]
+
+QUESTIONS FOR CHAD
+1. [Exact question to ask] — WHY: [what this unlocks or reveals]
+2. [Exact question to ask] — WHY: [what this unlocks or reveals]
+3. [Exact question to ask] — WHY: [what this unlocks or reveals]"""
+
+    try:
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            resp = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "HTTP-Referer": "https://guardz-demo.up.railway.app",
+                    "X-Title": "Guardz Sales Agent",
+                },
+                json={
+                    "model": OPENROUTER_MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 700,
+                    "temperature": 0.3,
+                }
+            )
+            if resp.status_code == 200:
+                return resp.json()["choices"][0]["message"]["content"].strip()
+            else:
+                print(f"[brief] OpenRouter {resp.status_code}: {resp.text[:200]}")
+    except Exception as e:
+        print(f"[brief] Error: {e}")
+    return ""
+
 @app.post("/notify/human", response_model=NotifyHumanResponse)
 async def notify_human(req: NotifyHumanRequest):
     label = SIGNAL_LABELS.get(req.signal_type, SIGNAL_LABELS["other"])
@@ -377,26 +466,63 @@ async def notify_human(req: NotifyHumanRequest):
     if not SLACK_WEBHOOK_URL:
         return NotifyHumanResponse(ok=True, detail="SLACK_WEBHOOK_URL not configured")
 
+    # Determine if this is a handoff signal → generate full brief
+    is_handoff = req.signal_type in ("handoff_requested", "strong_interest", "demo_agreed", "named_client")
+    brief_text = ""
+    if is_handoff:
+        job = _demo_jobs[0] if _demo_jobs else {}
+        brief_text = await _generate_sales_brief(
+            transcript=_live_transcript,
+            company=job.get("company") or {},
+            sales_context=job.get("sales_context") or {},
+            prospect_name=req.prospect_name,
+            company_name=req.company_name,
+        )
+
     convo_url = (f"https://elevenlabs.io/app/conversational-ai/conversations/{req.session_id}"
                  if req.session_id else "")
-    blocks = [
-        {"type":"header","text":{"type":"plain_text","text":"🔥 HOT LEAD — Transfer Ready","emoji":True}},
-        {"type":"section","fields":[
-            {"type":"mrkdwn","text":f"*Name:*\n{req.prospect_name or '(not collected)'}"},
-            {"type":"mrkdwn","text":f"*Company:*\n{req.company_name or '(unknown)'}"},
-        ]},
-        {"type":"section","text":{"type":"mrkdwn","text":f"*Signal:* {label}"}},
-        {"type":"section","text":{"type":"mrkdwn","text":f"*They said:*\n> {req.message or '(no message captured)'}"}},
-    ]
+
+    # ── Build Slack blocks ────────────────────────────────────────────────────
+    if is_handoff:
+        blocks = [
+            {"type":"header","text":{"type":"plain_text","text":"🔥 HANDOFF — Chad, you're up","emoji":True}},
+            {"type":"section","fields":[
+                {"type":"mrkdwn","text":f"*Prospect:*\n{req.prospect_name or '(not collected)'}"},
+                {"type":"mrkdwn","text":f"*Company:*\n{req.company_name or '(unknown)'}"},
+            ]},
+            {"type":"section","text":{"type":"mrkdwn","text":f"*Signal:* {label}\n*Last thing they said:*\n> {req.message or ''}"}},
+        ]
+        if brief_text:
+            # Split brief into sections for Slack (max 3000 chars per block)
+            blocks.append({"type":"divider"})
+            blocks.append({"type":"section","text":{"type":"mrkdwn","text":f"*📋 SALES BRIEF*\n```{brief_text[:2900]}```"}})
+        if _live_transcript:
+            tx_lines = [f"{'🤖' if t.get('role')=='agent' else '👤'} {t.get('message','')[:120]}"
+                        for t in _live_transcript[-8:]]
+            tx_preview = "\n".join(tx_lines)
+            blocks.append({"type":"divider"})
+            blocks.append({"type":"section","text":{"type":"mrkdwn",
+                "text":f"*📝 TRANSCRIPT (last {min(8,len(_live_transcript))} turns)*\n```{tx_preview[:2900]}```"}})
+    else:
+        # Non-handoff signals — keep lightweight
+        blocks = [
+            {"type":"section","fields":[
+                {"type":"mrkdwn","text":f"*{label}*"},
+                {"type":"mrkdwn","text":f"{req.prospect_name or '?'} @ {req.company_name or '?'}"},
+            ]},
+            {"type":"section","text":{"type":"mrkdwn","text":f"> {req.message or ''}"}},
+        ]
+
     if convo_url:
         blocks.append({"type":"actions","elements":[{
             "type":"button","style":"primary","url":convo_url,
-            "text":{"type":"plain_text","text":"View Live Conversation","emoji":True}}]})
+            "text":{"type":"plain_text","text":"View Conversation","emoji":True}}]})
+
     try:
         import httpx
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.post(SLACK_WEBHOOK_URL,
-                json={"text":f"🔥 {req.prospect_name or 'Unknown'} @ {req.company_name or 'Unknown'} — {label}","blocks":blocks})
+        fallback = f"🔥 {req.prospect_name or 'Unknown'} @ {req.company_name or 'Unknown'} — {label}"
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(SLACK_WEBHOOK_URL, json={"text": fallback, "blocks": blocks})
             resp.raise_for_status()
         return NotifyHumanResponse(ok=True)
     except Exception as e:
