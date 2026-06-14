@@ -1085,16 +1085,20 @@ async def _generate_copilot(messages: list) -> dict:
         "Return ONLY this JSON, no prose:\n"
         '{"health":"green|yellow|red","intent":<integer 0-100>,'
         '"tone":"<3-7 word read of the customer\'s mood/intent>",'
-        '"tips":["<short bullet>","<short bullet>"]}\n\n'
-        "For \"tips\": 1-3 VERY SHORT bullets the rep can scan mid-chat — max ~10 words each, no full "
-        "sentences. Each bullet is a gap or a next move, e.g. \"Mention the free tier\", "
-        "\"Ask which client to start with\", \"You skipped the price worry\", \"Get their email\". "
-        "Especially flag anything they SHOULD have brought up but didn't. Do NOT write their reply for "
-        "them. If they nailed it, one bullet can affirm (e.g. \"Great expertise reassurance\").\n\n"
-        "A strong rep ties Guardz to the clients' real pain (cyber-insurance pressure, ransomware), "
-        "mentions the free Community tier + $5-15/user pricing, offers the risk report they can show "
-        "clients, reassures 'you don't need to be a security expert,' asks how many clients / which to "
-        "start with, and gets the partner's email + a callback.\n\n"
+        '"tips":["<tip>","<tip>"]}\n\n'
+        "TIPS RULES:\n"
+        "- 1-3 tips, each a TERSE fragment, MAX 6 WORDS. No sentences, no reasoning. "
+        "Good: 'Ask what prompted this', 'Find out what they sell', 'Mention free tier', "
+        "'Acknowledge the price worry', 'Get their email'.\n"
+        "- MATCH THE STAGE — never jump ahead:\n"
+        "  * Opening (first 1-2 exchanges): basic discovery ONLY — what prompted this, what they "
+        "sell, who their clients are. NO pilots, pricing, or email yet.\n"
+        "  * Middle (engaged or raising a concern): address the concern, tie to their clients' pain, "
+        "mention the free tier or 'no security expertise needed'.\n"
+        "  * Late (clearly interested, asking price or next steps): only now move to pricing, a pilot "
+        "client, or getting their email.\n"
+        "- Flag what they missed FOR THE CURRENT STAGE. If they did well, one tip can affirm "
+        "(e.g. 'Good discovery question'). Never write their reply for them.\n\n"
         "health: green = engaged/buying; yellow = neutral/hesitant; red = objection/frustrated. "
         "Base everything ONLY on what was actually said.\n\n"
         f"CHAT:\n{convo}"
@@ -1415,13 +1419,13 @@ COPILOT_PAGE = """<!DOCTYPE html>
  header { height:50px; background:#0d0d24; border-bottom:1px solid rgba(255,255,255,.07); display:flex; align-items:center; justify-content:space-between; padding:0 20px }
  .hlogo { font-size:14px; font-weight:700; color:#a78bfa; letter-spacing:.1em; text-transform:uppercase }
  .reset { font-size:11px; color:#6b7280; background:none; border:1px solid rgba(255,255,255,.1); border-radius:6px; padding:4px 10px; cursor:pointer }
- .wrap { display:grid; grid-template-columns:1fr 1fr 340px; height:calc(100vh - 50px); gap:1px; background:rgba(255,255,255,.05) }
+ .wrap { display:grid; grid-template-columns:1fr 360px; height:calc(100vh - 50px); gap:1px; background:rgba(255,255,255,.05) }
  .col { background:#0d0d24; display:flex; flex-direction:column; overflow:hidden }
  .col-h { padding:12px 16px; border-bottom:1px solid rgba(255,255,255,.06); font-size:11px; font-weight:700; letter-spacing:.1em; text-transform:uppercase; color:#6b7280 }
  .msgs { flex:1; overflow-y:auto; padding:14px; display:flex; flex-direction:column; gap:8px }
  .b { max-width:85%; padding:8px 12px; border-radius:10px; font-size:13px; line-height:1.5 }
- .b.customer { align-self:flex-start; background:rgba(14,165,233,.12); border:1px solid rgba(14,165,233,.2); color:#bae6fd }
- .b.rep { align-self:flex-end; background:rgba(124,58,237,.15); border:1px solid rgba(124,58,237,.25); color:#ddd6fe }
+ .b.customer { align-self:flex-start; background:rgba(16,185,129,.13); border:1px solid rgba(16,185,129,.32); color:#a7f3d0 }
+ .b.rep { align-self:flex-end; background:rgba(167,139,250,.16); border:1px solid rgba(167,139,250,.34); color:#ddd6fe }
  .inrow { display:flex; gap:8px; padding:12px; border-top:1px solid rgba(255,255,255,.06) }
  .inrow input { flex:1; background:rgba(255,255,255,.05); border:1px solid rgba(255,255,255,.1); border-radius:8px; padding:9px 12px; color:#fff; font-size:13px; outline:none }
  .inrow button { background:linear-gradient(135deg,#7c3aed,#4f46e5); border:none; border-radius:8px; color:#fff; font-size:13px; font-weight:700; padding:9px 14px; cursor:pointer }
@@ -1451,13 +1455,8 @@ COPILOT_PAGE = """<!DOCTYPE html>
 </header>
 <div class="wrap">
  <div class="col">
-   <div class="col-h">Customer (play the reseller)</div>
-   <div class="msgs" id="cust-msgs"></div>
-   <div class="inrow"><input id="cust-in" placeholder="Type as the customer..." onkeydown="if(event.key==='Enter')send('customer')"><button onclick="send('customer')">Send</button></div>
- </div>
- <div class="col">
-   <div class="col-h">Rep (you)</div>
-   <div class="msgs" id="rep-msgs"></div>
+   <div class="col-h">Conversation &mdash; <span style="color:#a7f3d0">customer</span> &middot; <span style="color:#c4b5fd">rep (you)</span></div>
+   <div class="msgs" id="convo-msgs"></div>
    <div class="inrow"><input id="rep-in" placeholder="Reply to the customer..." onkeydown="if(event.key==='Enter')send('rep')"><button id="respbtn" onclick="suggestRep()" style="background:rgba(124,58,237,.18);border:1px solid rgba(124,58,237,.45);color:#c4b5fd;font-weight:600">Respond for me</button><button onclick="send('rep')">Send</button></div>
  </div>
  <div class="cop">
@@ -1478,9 +1477,9 @@ async function startDemo(){
   poll();
 }
 async function send(role){
-  const inp=document.getElementById(role==='customer'?'cust-in':'rep-in');
+  const inp=document.getElementById('rep-in');
   const t=(inp.value||'').trim(); if(!t)return; inp.value='';
-  await fetch('/chat/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:SID,role:role,message:t})});
+  await fetch('/chat/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:SID,role:role||'rep',message:t})});
   poll();
 }
 async function suggestRep(){
@@ -1495,7 +1494,7 @@ async function suggestRep(){
   btn.innerHTML=old; btn.disabled=false;
 }
 function useSug(){ if(lastSug){ const r=document.getElementById('rep-in'); r.value=lastSug; r.focus(); } }
-async function resetChat(){ await fetch('/chat/reset?session_id='+SID); document.getElementById('cust-msgs').innerHTML=''; document.getElementById('rep-msgs').innerHTML=''; setCoach({}); }
+async function resetChat(){ await fetch('/chat/reset?session_id='+SID); document.getElementById('convo-msgs').innerHTML=''; setCoach({}); }
 function esc(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 function renderMsgs(el,msgs){ el.innerHTML=msgs.map(m=>'<div class="b '+m.role+'">'+esc(m.text)+'</div>').join(''); el.scrollTop=el.scrollHeight; }
 function setCoach(c){
@@ -1512,8 +1511,7 @@ async function poll(){
   try{
     const r=await fetch('/chat/state?session_id='+SID); const d=await r.json();
     const msgs=d.messages||[];
-    renderMsgs(document.getElementById('cust-msgs'),msgs);
-    renderMsgs(document.getElementById('rep-msgs'),msgs);
+    renderMsgs(document.getElementById('convo-msgs'),msgs);
     setCoach(d.coach||{});
   }catch(e){}
 }
