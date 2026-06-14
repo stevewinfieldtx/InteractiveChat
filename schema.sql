@@ -90,3 +90,25 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE TRIGGER trg_conversations_updated
     BEFORE UPDATE ON conversations
     FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+
+-- Partner leads — every reseller who calls in, for follow-up + engagement BI
+CREATE TABLE IF NOT EXISTS partner_leads (
+    id                SERIAL PRIMARY KEY,
+    session_id        TEXT UNIQUE,
+    partner_name      TEXT,
+    partner_company   TEXT,
+    partner_email     TEXT,
+    partner_phone     TEXT,
+    customer_vertical TEXT,
+    last_signal       TEXT,
+    signal_count      INT DEFAULT 0,
+    handed_off        BOOLEAN DEFAULT FALSE,
+    brief             TEXT,
+    transcript        JSONB DEFAULT '[]',
+    first_seen        TIMESTAMPTZ DEFAULT NOW(),
+    last_seen         TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_partner_leads_email   ON partner_leads(partner_email);
+CREATE INDEX IF NOT EXISTS idx_partner_leads_company ON partner_leads(partner_company);
+CREATE INDEX IF NOT EXISTS idx_partner_leads_seen    ON partner_leads(last_seen DESC);

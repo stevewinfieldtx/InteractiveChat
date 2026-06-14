@@ -128,6 +128,26 @@ RETURNS TRIGGER AS $$ BEGIN NEW.updated_at = NOW(); RETURN NEW; END; $$ LANGUAGE
 
 CREATE OR REPLACE TRIGGER trg_conversations_updated
     BEFORE UPDATE ON conversations FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+
+CREATE TABLE IF NOT EXISTS partner_leads (
+    id SERIAL PRIMARY KEY,
+    session_id TEXT UNIQUE,
+    partner_name TEXT,
+    partner_company TEXT,
+    partner_email TEXT,
+    partner_phone TEXT,
+    customer_vertical TEXT,
+    last_signal TEXT,
+    signal_count INT DEFAULT 0,
+    handed_off BOOLEAN DEFAULT FALSE,
+    brief TEXT,
+    transcript JSONB DEFAULT '[]',
+    first_seen TIMESTAMPTZ DEFAULT NOW(),
+    last_seen TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_partner_leads_email   ON partner_leads(partner_email);
+CREATE INDEX IF NOT EXISTS idx_partner_leads_company ON partner_leads(partner_company);
+CREATE INDEX IF NOT EXISTS idx_partner_leads_seen    ON partner_leads(last_seen DESC);
 """
 
 @app.on_event("startup")
@@ -747,6 +767,41 @@ HANDOFF_SIGNALS = ("handoff_requested", "strong_interest", "demo_agreed",
                    "named_client", "pricing_question", "how_to_start")
 
 
+async def _save_lead(*, session_id, name, company, email, phone, vertical,
+                     signal, handed_off, brief, transcript):
+    """Progressively upsert a partner lead for follow-up + engagement BI. Best-effort."""
+    if not DATABASE_URL:
+        return
+    try:
+        import json as _j
+        pool = await get_pool()
+        await pool.execute(
+            """
+            INSERT INTO partner_leads
+                (session_id, partner_name, partner_company, partner_email, partner_phone,
+                 customer_vertical, last_signal, signal_count, handed_off, brief, transcript,
+                 first_seen, last_seen)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,1,$8,$9,$10,NOW(),NOW())
+            ON CONFLICT (session_id) DO UPDATE SET
+                partner_name      = COALESCE(NULLIF(EXCLUDED.partner_name,''),      partner_leads.partner_name),
+                partner_company   = COALESCE(NULLIF(EXCLUDED.partner_company,''),   partner_leads.partner_company),
+                partner_email     = COALESCE(NULLIF(EXCLUDED.partner_email,''),     partner_leads.partner_email),
+                partner_phone     = COALESCE(NULLIF(EXCLUDED.partner_phone,''),     partner_leads.partner_phone),
+                customer_vertical = COALESCE(NULLIF(EXCLUDED.customer_vertical,''), partner_leads.customer_vertical),
+                last_signal       = EXCLUDED.last_signal,
+                signal_count      = partner_leads.signal_count + 1,
+                handed_off        = partner_leads.handed_off OR EXCLUDED.handed_off,
+                brief             = COALESCE(NULLIF(EXCLUDED.brief,''),             partner_leads.brief),
+                transcript        = EXCLUDED.transcript,
+                last_seen         = NOW()
+            """,
+            session_id or "unknown", name or "", company or "", email or "", phone or "",
+            vertical or "", signal or "", handed_off, brief or "", _j.dumps(transcript or []),
+        )
+    except Exception as e:
+        print(f"[leads] save failed: {e}")
+
+
 @app.post("/notify/human", response_model=NotifyHumanResponse)
 async def notify_human(req: NotifyHumanRequest):
     label = SIGNAL_LABELS.get(req.signal_type, SIGNAL_LABELS["other"])
@@ -798,6 +853,7 @@ async def _process_notification(req: NotifyHumanRequest, label: str):
             "triggers": (sales_context.get("buying_triggers") or [])[:5],
             "regulations": (sales_context.get("regulatory_pressures") or [])[:4],
         }
+        brief_text = ""
 
         # ── Email handoff ──────────────────────────────────────────────────────
         if is_handoff:
@@ -829,6 +885,18 @@ async def _process_notification(req: NotifyHumanRequest, label: str):
         # ── Slack (optional, off unless SLACK_WEBHOOK_URL is set) ───────────────
         if SLACK_WEBHOOK_URL:
             await _post_slack(req, label, is_handoff, customer_co, sales_context, transcript)
+
+        # ── Persist the lead for follow-up + engagement BI (every notify_human) ──
+        await _save_lead(
+            session_id=req.session_id,
+            name=contact["name"], company=contact["company"],
+            email=contact["email"], phone=contact["phone"],
+            vertical=customer["industry"] or customer["name"],
+            signal=req.signal_type,
+            handed_off=is_handoff and bool(contact["phone"]),
+            brief=brief_text,
+            transcript=transcript,
+        )
     except Exception as e:
         print(f"[notify] worker error: {e}")
 
@@ -941,6 +1009,24 @@ async def _poll_transcript(conversation_id: str):
 @app.get("/demo/state")
 async def demo_state():
     return {"jobs": _demo_jobs, "signals": _demo_signals, "transcript": _live_transcript}
+
+
+@app.get("/leads")
+async def list_leads(limit: int = 100):
+    """The captured partner list — for follow-up and engagement BI."""
+    if not DATABASE_URL:
+        return {"leads": [], "detail": "no database configured"}
+    try:
+        pool = await get_pool()
+        rows = await pool.fetch(
+            """SELECT session_id, partner_name, partner_company, partner_email, partner_phone,
+                      customer_vertical, last_signal, signal_count, handed_off,
+                      first_seen, last_seen
+               FROM partner_leads ORDER BY last_seen DESC LIMIT $1""",
+            limit)
+        return {"count": len(rows), "leads": [dict(r) for r in rows]}
+    except Exception as e:
+        return {"leads": [], "error": str(e)}
 
 @app.get("/demo/reset")
 async def demo_reset():
