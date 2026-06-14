@@ -52,6 +52,8 @@ _active_conv_id: str = ""
 _transcript_task: asyncio.Task | None = None
 # Per-session handoff state so we ping availability once and email the brief once.
 _handoff_state: dict[str, dict] = {}
+# Live chat-copilot state (per session): messages + latest coaching.
+_chats: dict[str, dict] = {}
 
 def _upsert_demo_job(session_id: str, **fields):
     for job in _demo_jobs:
@@ -993,6 +995,187 @@ async def add_transcript(turn: TranscriptTurn):
             _live_transcript = _live_transcript[-200:]
     return {"ok": True, "turns": len(_live_transcript)}
 
+
+class CallEndedRequest(BaseModel):
+    turns: list[dict] = []
+
+
+async def _generate_call_summary(transcript: list, customer: dict, sales_context: dict) -> str:
+    """Post-call wrap-up: a tight summary + 3 next-direction questions, from the FULL transcript."""
+    if not OPENROUTER_API_KEY or not transcript:
+        return ""
+    import httpx
+    tx = "\n".join(
+        f"{'AGENT' if t.get('role') == 'agent' else 'PARTNER'}: {(t.get('message') or '').strip()}"
+        for t in transcript
+    )
+    cu = customer or {}
+    ctx = sales_context or {}
+    market = cu.get("company_name") or ctx.get("industry") or ""
+    pains = ", ".join((ctx.get("pain_points") or [])[:4])
+    ctx_line = (f"Partner's customer market: {market}." if market else "")
+    if pains:
+        ctx_line += f" Known customer pains: {pains}."
+
+    prompt = f"""You are a sales coach at Rain Networks. A rep just finished a call with an IT reseller (the PARTNER) about selling Guardz to the partner's own customers. {ctx_line}
+
+Read the transcript (lines marked PARTNER are the human prospect; AGENT is our rep). Use ONLY what was actually said — do not invent interest or details.
+
+Write the brief in exactly this format:
+
+SUMMARY
+3-4 tight sentences: who the partner is, what their customers need, and exactly where this stands now.
+
+NEXT QUESTIONS
+Three specific questions the rep should ask on the NEXT call to move this forward. Each on its own line as: "1. <question> — WHY: <one line>". Make them follow naturally from what was actually discussed — not generic.
+
+TRANSCRIPT:
+{tx}"""
+    try:
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            resp = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                         "HTTP-Referer": "https://interactivechat.up.railway.app",
+                         "X-Title": "Rain Networks"},
+                json={"model": OPENROUTER_MODEL,
+                      "messages": [{"role": "user", "content": prompt}],
+                      "max_tokens": 600, "temperature": 0.3},
+            )
+        if resp.status_code == 200:
+            return resp.json()["choices"][0]["message"]["content"].strip()
+        print(f"[summary] OpenRouter {resp.status_code}: {resp.text[:160]}")
+    except Exception as e:
+        print(f"[summary] error: {e}")
+    return ""
+
+
+@app.post("/demo/call-ended")
+async def call_ended(req: CallEndedRequest):
+    """Called by the browser when the call ends — returns a post-call summary + next questions."""
+    transcript = req.turns or list(_live_transcript)
+    job = _demo_jobs[0] if _demo_jobs else {}
+    summary = await _generate_call_summary(
+        transcript, job.get("company") or {}, job.get("sales_context") or {})
+    return {"summary": summary or "(summary unavailable — check OPENROUTER_API_KEY / transcript)"}
+
+
+# ─── Live chat copilot (human-led chat, AI coaches on a side channel) ──────────
+
+class ChatMessage(BaseModel):
+    session_id: str = "copilot"
+    role: str = "customer"   # "customer" or "rep"
+    message: str = ""
+
+
+async def _generate_copilot(messages: list) -> dict:
+    """Score the live chat + coach the rep: health (green/yellow/red), intent, tone, next move."""
+    if not OPENROUTER_API_KEY or not messages:
+        return {}
+    import json as _j
+    import httpx
+    convo = "\n".join(
+        f"{'CUSTOMER' if m.get('role') == 'customer' else 'REP'}: {m.get('text','')}"
+        for m in messages[-20:]
+    )
+    prompt = (
+        "You are a live sales coach sitting beside a Rain Networks rep who is chatting with an IT "
+        "reseller (the CUSTOMER) about selling Guardz to the reseller's own clients. Your job is to "
+        "make the REP better — NOT to talk for them.\n\n"
+        "Return ONLY this JSON, no prose:\n"
+        '{"health":"green|yellow|red","intent":<integer 0-100>,'
+        '"tone":"<3-7 word read of the customer\'s mood/intent>",'
+        '"suggestion":"<a short, gentle nudge to the rep>"}\n\n'
+        "For \"suggestion\": coach the rep. Especially call out, gently, anything they SHOULD have "
+        "brought up but didn't — e.g. \"You didn't mention the free Community tier — raise it to ease "
+        "the price worry,\" or \"They mentioned 12 clients but you haven't asked which one to start "
+        "with,\" or \"Don't forget to grab their email.\" Do NOT write their reply for them; nudge so "
+        "they improve their OWN next response. If they handled it well, say so briefly and add the one "
+        "best next thing.\n\n"
+        "A strong rep ties Guardz to the clients' real pain (cyber-insurance pressure, ransomware), "
+        "mentions the free Community tier + $5-15/user pricing, offers the risk report they can show "
+        "clients, reassures 'you don't need to be a security expert,' asks how many clients / which to "
+        "start with, and gets the partner's email + a callback.\n\n"
+        "health: green = engaged/buying; yellow = neutral/hesitant; red = objection/frustrated. "
+        "Base everything ONLY on what was actually said.\n\n"
+        f"CHAT:\n{convo}"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                         "HTTP-Referer": "https://interactivechat.up.railway.app",
+                         "X-Title": "Rain Networks Copilot"},
+                json={"model": OPENROUTER_MODEL, "messages": [{"role": "user", "content": prompt}],
+                      "max_tokens": 300, "temperature": 0.3},
+            )
+        if resp.status_code == 200:
+            txt = resp.json()["choices"][0]["message"]["content"]
+            i, j = txt.find("{"), txt.rfind("}")
+            if i != -1 and j != -1:
+                return _j.loads(txt[i:j + 1])
+        else:
+            print(f"[copilot] OpenRouter {resp.status_code}: {resp.text[:160]}")
+    except Exception as e:
+        print(f"[copilot] error: {e}")
+    return {}
+
+
+async def _post_copilot_slack(coach: dict, messages: list):
+    if not SLACK_WEBHOOK_URL or not coach:
+        return
+    emoji = {"green": "🟢", "yellow": "🟡", "red": "🔴"}.get(coach.get("health", "yellow"), "🟡")
+    last_cust = next((m["text"] for m in reversed(messages) if m.get("role") == "customer"), "")
+    text = (f"{emoji} *Call health: {coach.get('health','?')}*  ·  Intent {coach.get('intent','?')}%\n"
+            f"*Read:* {coach.get('tone','')}\n"
+            f"*Customer just said:* {last_cust[:180]}\n"
+            f"*Coaching nudge:* {coach.get('suggestion','')}")
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(SLACK_WEBHOOK_URL, json={"text": text})
+    except Exception as e:
+        print(f"[copilot-slack] {e}")
+
+
+async def _run_copilot(session_id: str):
+    chat = _chats.get(session_id)
+    if not chat or not chat.get("messages"):
+        return
+    coach = await _generate_copilot(chat["messages"])
+    if coach:
+        chat["coach"] = coach
+        await _post_copilot_slack(coach, chat["messages"])
+
+
+@app.post("/chat/send")
+async def chat_send(msg: ChatMessage, background_tasks: BackgroundTasks):
+    sid = msg.session_id or "copilot"
+    chat = _chats.setdefault(sid, {"messages": [], "coach": {}})
+    text = (msg.message or "").strip()
+    if not text:
+        return {"ok": False}
+    role = "rep" if msg.role == "rep" else "customer"
+    chat["messages"].append({"role": role, "text": text, "ts": datetime.utcnow().isoformat()})
+    if len(chat["messages"]) > 100:
+        chat["messages"] = chat["messages"][-100:]
+    # Coach after EVERY turn — including the rep's own — so we can nudge on what they missed.
+    background_tasks.add_task(_run_copilot, sid)
+    return {"ok": True, "count": len(chat["messages"])}
+
+
+@app.get("/chat/state")
+async def chat_state(session_id: str = "copilot"):
+    chat = _chats.get(session_id, {"messages": [], "coach": {}})
+    return {"messages": chat.get("messages", []), "coach": chat.get("coach", {})}
+
+
+@app.get("/chat/reset")
+async def chat_reset(session_id: str = "copilot"):
+    _chats.pop(session_id, None)
+    return {"ok": True}
+
 async def _poll_transcript(conversation_id: str):
     global _live_transcript
     if not ELEVENLABS_API_KEY:
@@ -1116,6 +1299,135 @@ async def root():
 </html>""")
 
 
+# Chat-copilot demo page (plain string — NOT an f-string, so JS braces/${} stay literal).
+COPILOT_PAGE = """<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Rain Networks — AI Copilot (Chat)</title>
+<style>
+ * { box-sizing:border-box; margin:0; padding:0 }
+ html,body { height:100%; background:#080818; color:#fff; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif }
+ header { height:50px; background:#0d0d24; border-bottom:1px solid rgba(255,255,255,.07); display:flex; align-items:center; justify-content:space-between; padding:0 20px }
+ .hlogo { font-size:14px; font-weight:700; color:#a78bfa; letter-spacing:.1em; text-transform:uppercase }
+ .reset { font-size:11px; color:#6b7280; background:none; border:1px solid rgba(255,255,255,.1); border-radius:6px; padding:4px 10px; cursor:pointer }
+ .wrap { display:grid; grid-template-columns:1fr 1fr 340px; height:calc(100vh - 50px); gap:1px; background:rgba(255,255,255,.05) }
+ .col { background:#0d0d24; display:flex; flex-direction:column; overflow:hidden }
+ .col-h { padding:12px 16px; border-bottom:1px solid rgba(255,255,255,.06); font-size:11px; font-weight:700; letter-spacing:.1em; text-transform:uppercase; color:#6b7280 }
+ .msgs { flex:1; overflow-y:auto; padding:14px; display:flex; flex-direction:column; gap:8px }
+ .b { max-width:85%; padding:8px 12px; border-radius:10px; font-size:13px; line-height:1.5 }
+ .b.customer { align-self:flex-start; background:rgba(14,165,233,.12); border:1px solid rgba(14,165,233,.2); color:#bae6fd }
+ .b.rep { align-self:flex-end; background:rgba(124,58,237,.15); border:1px solid rgba(124,58,237,.25); color:#ddd6fe }
+ .inrow { display:flex; gap:8px; padding:12px; border-top:1px solid rgba(255,255,255,.06) }
+ .inrow input { flex:1; background:rgba(255,255,255,.05); border:1px solid rgba(255,255,255,.1); border-radius:8px; padding:9px 12px; color:#fff; font-size:13px; outline:none }
+ .inrow button { background:linear-gradient(135deg,#7c3aed,#4f46e5); border:none; border-radius:8px; color:#fff; font-size:13px; font-weight:700; padding:9px 14px; cursor:pointer }
+ .cop { background:#0d0d24; padding:16px; overflow-y:auto }
+ .light { display:flex; align-items:center; gap:14px; margin-bottom:18px }
+ .dot { width:52px; height:52px; border-radius:50%; background:#374151; transition:all .3s }
+ .dot.green { background:#10b981; box-shadow:0 0 26px rgba(16,185,129,.6) }
+ .dot.yellow { background:#f59e0b; box-shadow:0 0 26px rgba(245,158,11,.6) }
+ .dot.red { background:#ef4444; box-shadow:0 0 26px rgba(239,68,68,.6) }
+ .lt { font-size:13px; color:#94a3b8 }
+ .lt b { display:block; font-size:18px; color:#e2e8f0; text-transform:capitalize }
+ .sec { margin-top:16px }
+ .sec-l { font-size:10px; font-weight:700; letter-spacing:.1em; text-transform:uppercase; color:#4b5563; margin-bottom:6px }
+ .tone { font-size:14px; color:#c4b5fd }
+ .sug { font-size:14px; color:#f1f5f9; line-height:1.5; background:rgba(124,58,237,.1); border:1px solid rgba(124,58,237,.25); border-radius:10px; padding:12px }
+ .usebtn { margin-top:8px; font-size:12px; color:#a78bfa; background:none; border:1px solid rgba(124,58,237,.4); border-radius:6px; padding:5px 10px; cursor:pointer }
+ .bar { height:6px; background:rgba(255,255,255,.08); border-radius:3px; overflow:hidden; margin-top:6px }
+ .bar > i { display:block; height:100%; background:linear-gradient(90deg,#7c3aed,#10b981); width:0%; transition:width .3s }
+</style></head>
+<body>
+<header>
+ <span class="hlogo">Rain Networks &middot; AI Copilot</span>
+ <div style="display:flex;gap:10px;align-items:center">
+   <button id="nextbtn" onclick="playNext()" style="font-size:13px;font-weight:700;color:#fff;background:linear-gradient(135deg,#7c3aed,#4f46e5);border:none;border-radius:8px;padding:7px 16px;cursor:pointer">&#9654; Next message</button>
+   <button class="reset" onclick="resetChat()">Reset</button>
+ </div>
+</header>
+<div class="wrap">
+ <div class="col">
+   <div class="col-h">Customer (play the reseller)</div>
+   <div class="msgs" id="cust-msgs"></div>
+   <div class="inrow"><input id="cust-in" placeholder="Type as the customer..." onkeydown="if(event.key==='Enter')send('customer')"><button onclick="send('customer')">Send</button></div>
+ </div>
+ <div class="col">
+   <div class="col-h">Rep (you)</div>
+   <div class="msgs" id="rep-msgs"></div>
+   <div class="inrow"><input id="rep-in" placeholder="Reply to the customer..." onkeydown="if(event.key==='Enter')send('rep')"><button onclick="send('rep')">Send</button></div>
+ </div>
+ <div class="cop">
+   <div class="col-h" style="padding:0 0 12px">AI Copilot</div>
+   <div class="light"><div class="dot" id="dot"></div><div class="lt">Call health<b id="health">&mdash;</b></div></div>
+   <div class="sec"><div class="sec-l">Intent</div><div id="intent" class="lt">&mdash;</div><div class="bar"><i id="intentbar"></i></div></div>
+   <div class="sec"><div class="sec-l">Tone / intent read</div><div class="tone" id="tone">Waiting for the customer...</div></div>
+   <div class="sec"><div class="sec-l">Coaching nudge</div><div class="sug" id="sug">&mdash;</div></div>
+   <div class="sec"><div class="sec-l" style="color:#374151">Coaching also posts to Slack when SLACK_WEBHOOK_URL is set.</div></div>
+ </div>
+</div>
+<script>
+const SID='copilot';
+let lastSug='';
+let scriptIdx=0;
+// Rep lines are deliberately realistic-but-imperfect so the copilot can nudge the gaps.
+const SCRIPT=[
+ {role:'customer',text:"Hey, I run a small IT shop — I support a bunch of dental offices. Someone said you do Guardz. What is it?"},
+ {role:'rep',text:"It's an all-in-one security platform — email security, EDR, identity, all in one dashboard you manage for your clients."},
+ {role:'customer',text:"Okay. A couple of them just got cyber insurance renewals demanding MFA and endpoint protection. Also, I'm not a security expert, and my clients are pretty cheap."},
+ {role:'rep',text:"Don't worry, you don't need to be a security expert — Guardz handles the monitoring for you."},
+ {role:'customer',text:"Yeah but the price is really my concern. They won't pay for yet another tool."},
+ {role:'rep',text:"Totally fair — most partners just add it at five to fifteen a user on the existing contract, and clients say yes once they see their own risk report."},
+ {role:'customer',text:"Huh, the risk report is interesting. I've got about twelve dental clients — I could probably start with one to test it."},
+ {role:'rep',text:"Perfect — which client did you have in mind?"},
+ {role:'customer',text:"Probably my biggest one, Bright Smile Dental. What's partner pricing, and how fast could I go live?"},
+ {role:'rep',text:"Let me grab your best email and I'll have our partner specialist Steve walk you through pricing and onboarding — he can get Bright Smile live in about a day."}
+];
+async function playNext(){
+  const btn=document.getElementById('nextbtn');
+  if(scriptIdx>=SCRIPT.length){ btn.innerHTML='\\u2713 End of demo'; btn.disabled=true; return; }
+  const m=SCRIPT[scriptIdx++];
+  await fetch('/chat/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:SID,role:m.role,message:m.text})});
+  if(scriptIdx>=SCRIPT.length){ btn.innerHTML='\\u2713 End of demo'; btn.disabled=true; }
+  poll();
+}
+async function send(role){
+  const inp=document.getElementById(role==='customer'?'cust-in':'rep-in');
+  const t=(inp.value||'').trim(); if(!t)return; inp.value='';
+  await fetch('/chat/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:SID,role:role,message:t})});
+  poll();
+}
+function useSug(){ if(lastSug){ const r=document.getElementById('rep-in'); r.value=lastSug; r.focus(); } }
+async function resetChat(){ await fetch('/chat/reset?session_id='+SID); scriptIdx=0; const b=document.getElementById('nextbtn'); b.disabled=false; b.innerHTML='&#9654; Next message'; document.getElementById('cust-msgs').innerHTML=''; document.getElementById('rep-msgs').innerHTML=''; setCoach({}); }
+function esc(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function renderMsgs(el,msgs){ el.innerHTML=msgs.map(m=>'<div class="b '+m.role+'">'+esc(m.text)+'</div>').join(''); el.scrollTop=el.scrollHeight; }
+function setCoach(c){
+  const h=c.health||''; const dot=document.getElementById('dot');
+  dot.className='dot'+(h?(' '+h):'');
+  document.getElementById('health').textContent=h||'\\u2014';
+  document.getElementById('intent').textContent=(c.intent!=null?c.intent+'%':'\\u2014');
+  document.getElementById('intentbar').style.width=(c.intent!=null?c.intent:0)+'%';
+  document.getElementById('tone').textContent=c.tone||'Waiting for the customer...';
+  document.getElementById('sug').textContent=c.suggestion||'\\u2014';
+  lastSug=c.suggestion||'';
+}
+async function poll(){
+  try{
+    const r=await fetch('/chat/state?session_id='+SID); const d=await r.json();
+    const msgs=d.messages||[];
+    renderMsgs(document.getElementById('cust-msgs'),msgs);
+    renderMsgs(document.getElementById('rep-msgs'),msgs);
+    setCoach(d.coach||{});
+  }catch(e){}
+}
+setInterval(poll,1500); poll();
+</script>
+</body></html>"""
+
+
+@app.get("/copilot", response_class=HTMLResponse)
+async def copilot_page():
+    return HTMLResponse(COPILOT_PAGE)
+
+
 # Live-call script (plain string — NOT an f-string, so JS braces stay literal).
 # __AGENT_ID__ is substituted at serve time. Appended after </html> in demo_live.
 VOICE_SDK_JS = """
@@ -1159,7 +1471,7 @@ async function toggleCall() {
           });
         }
       },
-      onDisconnect: () => { convSession = null; setCallUI(false); },
+      onDisconnect: () => { convSession = null; setCallUI(false); summarizeCall(); },
       onError: (e) => { console.error('[convai] error', e); },
       onModeChange: (m) => {
         const cs = document.getElementById('chat-status');
@@ -1185,6 +1497,36 @@ async function toggleCall() {
     if (cs) cs.textContent = 'Could not start the call \\u2014 check mic permission.';
   }
 }
+function escapeHtml(s) {
+  return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+async function summarizeCall() {
+  const body   = document.getElementById('transcript-body');
+  const status = document.getElementById('transcript-status');
+  if (status) status.textContent = 'Generating call summary\\u2026';
+  try {
+    const r = await fetch('/demo/call-ended', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ turns: liveTurns })
+    });
+    const d = await r.json();
+    if (d && d.summary && body) {
+      const div = document.createElement('div');
+      div.style.cssText = 'margin-top:16px;padding:14px 16px;background:rgba(124,58,237,.12);border:1px solid rgba(124,58,237,.35);border-radius:10px';
+      div.innerHTML =
+        '<div style="font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#a78bfa;margin-bottom:8px">Call Summary &amp; Next Questions</div>' +
+        '<div style="font-size:13px;color:#ddd6fe;line-height:1.6;white-space:pre-wrap">' + escapeHtml(d.summary) + '</div>';
+      body.appendChild(div);
+      body.scrollTop = body.scrollHeight;
+    }
+    if (status) status.textContent = 'Transcript + summary';
+  } catch (e) {
+    console.error('[summary]', e);
+    if (status) status.textContent = 'Call ended';
+  }
+}
+
 window.toggleCall = toggleCall;
 </script>
 """
