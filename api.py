@@ -591,29 +591,51 @@ async def demo_live():
 
 <div class="panels">
 
-  <!-- Panel 1: Chat -->
+  <!-- Panel 1: Demo Caller -->
   <div class="panel">
     <div class="panel-head">
       <div class="panel-title">Panel 1</div>
-      <div class="panel-status">💬 Conversation</div>
+      <div class="panel-status">📞 Demo Caller</div>
     </div>
     <div class="panel-body">
-      <div class="chat-hint">
-        <p style="font-weight:600;color:#a78bfa;margin-bottom:12px">How to use this demo</p>
-        <div class="step">
-          <div class="step-num">1</div>
-          <div class="step-text">Click the <strong>Guardz widget</strong> in the bottom-right corner to start a voice conversation with the AI agent.</div>
-        </div>
-        <div class="step">
-          <div class="step-num">2</div>
-          <div class="step-text">When asked, give your <strong>name and business email</strong>. The agent will trigger background research.</div>
-        </div>
-        <div class="step">
-          <div class="step-num">3</div>
-          <div class="step-text">Watch <strong>Panel 2</strong> populate with company intel and <strong>Panel 3</strong> light up when you show buying signals.</div>
+
+      <div style="margin-bottom:16px">
+        <div style="font-size:17px;font-weight:700;color:#f1f5f9">Alex Chen</div>
+        <div style="font-size:12px;color:#6b7280;margin-top:2px">PacificTech IT Solutions &middot; San Diego, CA</div>
+      </div>
+
+      <div class="section">
+        <div class="section-label">His Situation</div>
+        <div style="font-size:12px;color:#94a3b8;line-height:1.8">
+          &bull; ESET Advanced Partner &mdash; 4 years<br>
+          &bull; 22 SMB clients (~380 endpoints)<br>
+          &bull; Dental client phished 3 months ago<br>
+          &bull; Cyber insurance renewals forcing action<br>
+          &bull; ESET Inspect only on 4 of 22 clients
         </div>
       </div>
-      <div id="chat-status" style="font-size:12px;color:#4b5563;text-align:center;padding:8px 0">
+
+      <div class="section">
+        <div class="section-label">Pain Points to Unlock</div>
+        <div style="font-size:12px;color:#94a3b8;line-height:1.8">
+          &bull; No MDR &mdash; on call 24/7 for incidents<br>
+          &bull; M365 clients on default Defender only<br>
+          &bull; No cyber insurance offering for clients<br>
+          &bull; Lost a 30-seat deal to larger MSP<br>
+          &bull; Annual ESET revenue, wants MRR
+        </div>
+      </div>
+
+      <div class="section" style="background:rgba(99,102,241,.06);border:1px solid rgba(99,102,241,.15);border-radius:8px;padding:12px">
+        <div style="font-size:11px;font-weight:700;color:#818cf8;letter-spacing:.08em;margin-bottom:8px">HOW TO RUN THE DEMO</div>
+        <div style="font-size:12px;color:#94a3b8;line-height:1.8">
+          <span style="color:#a78bfa">&#9654;</span> <strong style="color:#e2e8f0">Alex widget</strong> (bottom-left) &mdash; the prospect<br>
+          <span style="color:#a78bfa">&#9654;</span> <strong style="color:#e2e8f0">Guardz widget</strong> (bottom-right) &mdash; AI sales agent<br>
+          Start Alex first, then Guardz picks up the conversation.
+        </div>
+      </div>
+
+      <div id="chat-status" style="font-size:12px;color:#4b5563;text-align:center;padding:8px 0;margin-top:8px">
         Waiting for conversation to start…
       </div>
     </div>
@@ -649,7 +671,16 @@ async def demo_live():
 
 </div>
 
-<!-- ElevenLabs Widget -->
+<!-- Corner labels -->
+<div style="position:fixed;bottom:88px;left:20px;z-index:9999;background:#1e293b;border:1px solid #334155;border-radius:6px;padding:4px 10px;font-size:10px;font-weight:700;color:#818cf8;letter-spacing:.08em;pointer-events:none">ALEX — DEMO CALLER</div>
+<div style="position:fixed;bottom:88px;right:20px;z-index:9999;background:#1e293b;border:1px solid #334155;border-radius:6px;padding:4px 10px;font-size:10px;font-weight:700;color:#a78bfa;letter-spacing:.08em;pointer-events:none">GUARDZ AGENT</div>
+
+<!-- Alex Demo Caller Widget (bottom-left) -->
+<div style="position:fixed;bottom:20px;left:20px;z-index:9998">
+  <elevenlabs-convai agent-id="agent_9901kv2gdw2ffbh97wnj4awss9v5"></elevenlabs-convai>
+</div>
+
+<!-- Guardz Sales Agent Widget (bottom-right) -->
 <elevenlabs-convai agent-id="{ELEVENLABS_AGENT_ID}"></elevenlabs-convai>
 <script src="https://elevenlabs.io/convai-widget/index.js" async type="text/javascript"></script>
 
