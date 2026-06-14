@@ -82,7 +82,6 @@ class SalesContext(BaseModel):
     domain: str
     confidence: str
     primary_source: str   # "company" | "blended" | "industry"
-
     company_name: str = ""
     company_description: str = ""
     company_size: str = ""
@@ -93,10 +92,8 @@ class SalesContext(BaseModel):
     company_tech_stack: list[str] = Field(default_factory=list)
     company_recent_news: list[str] = Field(default_factory=list)
     company_competitors: list[str] = Field(default_factory=list)
-
     industry: str
     sub_industry: str = ""
-
     pain_points: list[str] = Field(default_factory=list)
     buying_triggers: list[str] = Field(default_factory=list)
     common_objections: list[str] = Field(default_factory=list)
@@ -114,11 +111,25 @@ class ResearchResult(BaseModel):
     industry: IndustryProfile
     sales_context: Optional[SalesContext] = None
     duration_seconds: float = 0.0
-    source: str = "tavily"   # "tde" | "tde_cache" | "tavily"
+    source: str = "tavily"   # "tde" | "tavily"
 
 
 # ──────────────────────────────────────────────────────────
 # TDE integration
+#
+# Response shapes:
+#   POST /intel/research/company  → { source, domain, company_name,
+#                                     intel:{company_name,website,industry,sub_industry,country} }
+#     (minimal — rich data saved to DB but NOT returned here)
+#   GET  /intel/company/:domain   → { found, domain, company_name, industry, sub_industry, country,
+#                                     sections:{ painpoints:{data:{company_pain_points,technology_stack,...}},
+#                                                compete:{data:{competitors,...}},
+#                                                customer:{data:{recent_news,...}},
+#                                                leadership:{data:[{name,title}]} } }
+#   POST /intel/research/industry → { source, intel:{ industry_name,
+#                                                     pain_points:[{title,description,urgency,persona}],
+#                                                     trends:[{title,description,impact}],
+#                                                     regulations:[{name,description,impact}] } }
 # ──────────────────────────────────────────────────────────
 
 def _tde_headers() -> dict:
@@ -128,115 +139,169 @@ def _tde_headers() -> dict:
     return h
 
 
-def _map_tde_company(d: dict, domain: str) -> CompanyProfile:
-    """Map TDE company_intel row → CompanyProfile."""
-    intel = d.get("intel") or d  # /intel/research/company wraps in {intel:...}
+def _extract_strings(items, *keys) -> list:
+    """Turn a list of strings or dicts into a flat list of strings."""
+    out = []
+    for item in (items or []):
+        if isinstance(item, str) and item:
+            out.append(item)
+        elif isinstance(item, dict):
+            for k in keys:
+                v = item.get(k)
+                if v and isinstance(v, str):
+                    out.append(v)
+                    break
+    return out
 
-    # TDE may store pain points in several fields
-    pain = intel.get("company_pain_points") or intel.get("pain_points") or []
-    tech = intel.get("technology_stack") or intel.get("tech_stack_signals") or []
-    news = intel.get("recent_news") or []
-    competitors = intel.get("competitors") or intel.get("key_competitors") or []
 
-    # Infer confidence from data completeness
-    filled = sum(bool(intel.get(f)) for f in [
-        "company_name", "industry", "description", "employee_estimate",
-        "country", "founding_year",
+def _map_tde_company_full(row: dict, domain: str) -> CompanyProfile:
+    """
+    Map GET /intel/company/:domain full response → CompanyProfile.
+    Sections: painpoints, compete, customer, leadership.
+    """
+    sections = row.get("sections") or {}
+    pp   = (sections.get("painpoints") or {}).get("data") or {}
+    comp = (sections.get("compete") or {}).get("data") or {}
+    cust = (sections.get("customer") or {}).get("data") or {}
+
+    pain        = pp.get("company_pain_points") or pp.get("pain_points") or []
+    tech        = pp.get("technology_stack") or cust.get("technology_stack") or []
+    news        = cust.get("recent_news") or []
+    competitors = comp.get("competitors") or []
+
+    filled = sum(bool(row.get(f)) for f in [
+        "company_name", "industry", "sub_industry", "country", "website",
     ])
-    confidence = "high" if filled >= 5 else "medium" if filled >= 3 else "low"
+    has_sections = bool(pp or comp or cust)
+    confidence = "high" if (filled >= 4 and has_sections) else "medium" if filled >= 2 else "low"
 
-    # Employee estimate → size bucket
-    emp = str(intel.get("employee_estimate") or "")
-    size = ""
-    if emp:
-        try:
-            n = int("".join(c for c in emp if c.isdigit())[:6] or "0")
-            size = ("1-10" if n <= 10 else "11-50" if n <= 50 else
-                    "51-200" if n <= 200 else "201-1000" if n <= 1000 else "1000+")
-        except Exception:
-            size = emp
+    pain_strs = _extract_strings(pain, "title", "description")
 
     return CompanyProfile(
         domain=domain,
-        company_name=intel.get("company_name") or "",
-        description=intel.get("description") or "",
-        industry=intel.get("industry") or "",
-        sub_industry=intel.get("sub_industry") or "",
-        company_size=size,
-        estimated_revenue=intel.get("estimated_revenue") or "",
-        founded_year=intel.get("founding_year") or intel.get("founded_year"),
-        hq_location=intel.get("country") or intel.get("hq_location") or "",
-        business_model=intel.get("business_model") or "Services",
-        tech_stack_signals=tech if isinstance(tech, list) else [tech],
-        recent_news=news if isinstance(news, list) else [news],
-        funding_stage=intel.get("funding_stage") or "Unknown",
-        key_competitors=competitors if isinstance(competitors, list) else [competitors],
-        linkedin_url=intel.get("linkedin_url") or "",
+        company_name=row.get("company_name") or "",
+        description=cust.get("description") or "",
+        industry=row.get("industry") or "",
+        sub_industry=row.get("sub_industry") or "",
+        company_size="",
+        estimated_revenue="",
+        founded_year=None,
+        hq_location=row.get("country") or row.get("address") or "",
+        business_model=cust.get("pricing_model") or "Services",
+        tech_stack_signals=_extract_strings(tech if isinstance(tech, list) else [tech]),
+        recent_news=_extract_strings(
+            news if isinstance(news, list) else [news], "title", "headline", "text"
+        ),
+        funding_stage="Unknown",
+        key_competitors=_extract_strings(
+            competitors if isinstance(competitors, list) else [competitors]
+        ),
+        linkedin_url=row.get("linkedin_url") or "",
         confidence=confidence,
         research_notes=(
-            f"Sourced from TDE. Pain signals: "
-            + (", ".join(pain[:2]) if pain else "none extracted")
+            "Sourced from TDE swarm. Pain signals: "
+            + (", ".join(pain_strs[:2]) if pain_strs else "none extracted")
         ),
     )
 
 
 def _map_tde_industry(d: dict, industry: str, sub_industry: str) -> IndustryProfile:
-    """Map TDE industry_intel row → IndustryProfile."""
+    """
+    Map POST /intel/research/industry response → IndustryProfile.
+    pain_points / trends / regulations are lists of dicts with title/description.
+    """
     intel = d.get("intel") or d
 
-    def _lst(key):
-        v = intel.get(key, [])
-        return v if isinstance(v, list) else ([v] if v else [])
+    pain_pts = _extract_strings(intel.get("pain_points") or [], "title", "description")
+    trends   = _extract_strings(intel.get("trends") or [], "title", "description")
+    regs     = _extract_strings(intel.get("regulations") or [], "name", "description")
 
     return IndustryProfile(
-        industry=intel.get("industry") or industry,
+        industry=intel.get("industry_name") or intel.get("industry") or industry,
         sub_industry=intel.get("sub_industry") or sub_industry,
-        top_pain_points=_lst("top_pain_points") or _lst("pain_points"),
-        buying_triggers=_lst("buying_triggers"),
-        common_objections=_lst("common_objections"),
-        key_metrics_they_care_about=_lst("key_metrics") or _lst("key_metrics_they_care_about"),
-        industry_trends=_lst("industry_trends"),
-        regulatory_pressures=_lst("regulatory_pressures"),
-        typical_decision_makers=_lst("typical_decision_makers"),
-        average_sales_cycle=intel.get("average_sales_cycle") or "",
+        top_pain_points=pain_pts,
+        buying_triggers=[],
+        common_objections=[],
+        key_metrics_they_care_about=[],
+        industry_trends=trends,
+        regulatory_pressures=regs,
+        typical_decision_makers=[],
+        average_sales_cycle="",
     )
 
 
 async def _tde_research_company(domain: str) -> Optional[CompanyProfile]:
-    """Call TDE /intel/research/company — checks its own cache, runs swarm on miss."""
+    """
+    2-step TDE company research:
+      Step 1: POST /intel/research/company  — triggers swarm if cache miss, saves rich data to DB.
+              Returns only minimal intel in the response body.
+      Step 2: GET  /intel/company/:domain   — reads full rich data from DB (all sections).
+
+    Timeout: 90s for step 1 (fresh research = 4 LLM agents + web fetch).
+    """
     if not TDE_URL:
+        print("[TDE] TDE_API_URL not set — skipping TDE")
         return None
-    url = f"{TDE_URL}/intel/research/company"
+
+    headers = _tde_headers()
     payload = {"url": f"https://{domain}", "role": "partner", "name": ""}
+
     try:
-        async with httpx.AsyncClient(timeout=45.0) as client:
-            r = await client.post(url, json=payload, headers=_tde_headers())
-            if r.status_code == 200:
-                data = r.json()
-                print(f"[TDE] company research source={data.get('source','?')} for {domain}")
-                return _map_tde_company(data, domain)
-            print(f"[TDE] company research HTTP {r.status_code}: {r.text[:200]}")
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            # Step 1: trigger research
+            r1 = await client.post(
+                f"{TDE_URL}/intel/research/company",
+                json=payload, headers=headers,
+            )
+            if r1.status_code != 200:
+                print(f"[TDE] POST research HTTP {r1.status_code} for {domain}: {r1.text[:300]}")
+                return None
+            src = r1.json().get("source", "?")
+            print(f"[TDE] Step 1 done: source={src} for {domain}")
+
+            # Step 2: fetch full data from DB
+            r2 = await client.get(
+                f"{TDE_URL}/intel/company/{domain}",
+                headers=headers,
+            )
+            if r2.status_code != 200:
+                print(f"[TDE] GET full data HTTP {r2.status_code} for {domain}: {r2.text[:200]}")
+                return None
+            full = r2.json()
+            if not full.get("found"):
+                print(f"[TDE] GET returned found=false for {domain}")
+                return None
+            print(f"[TDE] Step 2 done: full intel for {domain} (sections: {list((full.get('sections') or {}).keys())})")
+            return _map_tde_company_full(full, domain)
+
+    except httpx.TimeoutException:
+        print(f"[TDE] Timeout (90s) researching {domain} — falling back to Tavily")
     except Exception as e:
-        print(f"[TDE] company research error: {e}")
+        print(f"[TDE] Error researching {domain}: {e}")
     return None
 
 
 async def _tde_research_industry(industry: str, sub_industry: str) -> Optional[IndustryProfile]:
-    """Call TDE /intel/research/industry."""
+    """
+    POST /intel/research/industry — returns pain_points, trends, regulations in the response body.
+    Single call, no need for a separate GET.
+    """
     if not TDE_URL:
         return None
-    url = f"{TDE_URL}/intel/research/industry"
-    payload = {"industry": industry, "sub_industry": sub_industry}
+    payload = {"industry": industry, "sub_industry": sub_industry or ""}
     try:
-        async with httpx.AsyncClient(timeout=45.0) as client:
-            r = await client.post(url, json=payload, headers=_tde_headers())
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.post(
+                f"{TDE_URL}/intel/research/industry",
+                json=payload, headers=_tde_headers(),
+            )
             if r.status_code == 200:
                 data = r.json()
-                print(f"[TDE] industry research source={data.get('source','?')} for {industry}")
+                print(f"[TDE] industry source={data.get('source','?')} for {industry}")
                 return _map_tde_industry(data, industry, sub_industry)
-            print(f"[TDE] industry research HTTP {r.status_code}: {r.text[:200]}")
+            print(f"[TDE] POST industry HTTP {r.status_code} for {industry}: {r.text[:200]}")
     except Exception as e:
-        print(f"[TDE] industry research error: {e}")
+        print(f"[TDE] industry error for {industry}: {e}")
     return None
 
 
@@ -244,7 +309,7 @@ async def _tde_research_industry(industry: str, sub_industry: str) -> Optional[I
 # Tavily fallback
 # ──────────────────────────────────────────────────────────
 
-async def _search(query: str, max_results: int = 5) -> list[dict]:
+async def _search(query: str, max_results: int = 5) -> list:
     if not tavily:
         return []
     try:
@@ -261,7 +326,7 @@ async def _search(query: str, max_results: int = 5) -> list[dict]:
         return [{"title": "Error", "content": str(e), "url": ""}]
 
 
-def _fmt(results: list[dict]) -> str:
+def _fmt(results: list) -> str:
     lines = []
     for r in results:
         lines.append(f"[{r.get('title','')}] {r.get('url','')}")
@@ -370,7 +435,7 @@ async def _synthesize_industry(industry: str, sub_industry: str, raw: str) -> In
     return IndustryProfile(**json.loads(text))
 
 
-async def _tavily_research(domain: str) -> tuple[CompanyProfile, IndustryProfile]:
+async def _tavily_research(domain: str):
     """Tavily + OpenRouter fallback pipeline."""
     company_raw = await _company_searches(domain)
     company_profile = await _synthesize_company(domain, company_raw)
@@ -387,14 +452,14 @@ async def _tavily_research(domain: str) -> tuple[CompanyProfile, IndustryProfile
 # Sales context resolver
 # ──────────────────────────────────────────────────────────
 
-def resolve_sales_context(result: "ResearchResult") -> SalesContext:
+def resolve_sales_context(result) -> SalesContext:
     c = result.company
     i = result.industry
     conf = c.confidence
 
     src_label = (
-        f"TDE ({'cached' if result.source == 'tde_cache' else 'live'})"
-        if result.source.startswith("tde")
+        "TDE (live)"
+        if result.source == "tde"
         else "web search"
     )
 
@@ -428,29 +493,29 @@ def resolve_sales_context(result: "ResearchResult") -> SalesContext:
         base["context_note"] = (
             f"Strong intel on {c.company_name} via {src_label}. "
             f"Reference their context ({c.business_model}, {c.company_size}, "
-            f"{c.funding_stage}) when framing pain points. "
-            f"Industry benchmarks below apply — personalize to what you know."
+            f"{c.funding_stage}) when framing pain points."
         )
     elif conf == "medium":
-        known = [f for f in [
+        confirmed = [x for x in [
             c.company_size and f"{c.company_size} employees",
             c.funding_stage not in ("", "Unknown") and c.funding_stage,
             c.business_model or "",
             c.hq_location and f"based in {c.hq_location}",
-        ] if f]
+        ] if x]
+        confirmed_str = ", ".join(confirmed) if confirmed else "company name only"
         base["primary_source"] = "blended"
         base["context_note"] = (
             f"Partial intel for {c.company_name or c.domain} via {src_label}. "
-            f"Confirmed: {', '.join(known) or 'company name only'}. "
-            f"Fill gaps with {i.industry} industry benchmarks. "
-            f"Use discovery questions to confirm specifics."
+            f"Confirmed: {confirmed_str}. "
+            f"Fill gaps with {i.industry} benchmarks. "
+            "Use discovery questions to confirm specifics."
         )
     else:
         base["primary_source"] = "industry"
         base["context_note"] = (
             f"Limited public info for {c.domain} via {src_label}. "
-            f"Relying on {i.industry} industry benchmarks as primary anchor. "
-            f"Treat pain points below as hypotheses to confirm, not facts."
+            f"Relying on {i.industry} industry benchmarks. "
+            "Treat pain points as hypotheses to confirm."
         )
 
     return SalesContext(**base)
@@ -460,12 +525,14 @@ def resolve_sales_context(result: "ResearchResult") -> SalesContext:
 # Main entry point
 # ──────────────────────────────────────────────────────────
 
-async def research_company(domain: str) -> "ResearchResult":
+async def research_company(domain: str) -> ResearchResult:
     """
     Full pipeline: domain → ResearchResult with sales_context.
 
-    1. Try TDE (cache-first, then research swarm) — ~5-20s first run, <1s cache hit
-    2. Fall back to Tavily + OpenRouter if TDE is unavailable — ~10-20s
+    1. Try TDE (cache-first, then research swarm):
+       - POST /intel/research/company  (up to 90s for fresh research)
+       - GET  /intel/company/:domain   (fast DB read for full data)
+    2. Fall back to Tavily + OpenRouter if TDE fails.
     """
     start = datetime.utcnow()
     source = "tavily"
@@ -473,7 +540,6 @@ async def research_company(domain: str) -> "ResearchResult":
     company_profile: Optional[CompanyProfile] = None
     industry_profile: Optional[IndustryProfile] = None
 
-    # ── TDE path ──────────────────────────────────────────
     if TDE_URL:
         company_profile = await _tde_research_company(domain)
         if company_profile:
@@ -483,13 +549,11 @@ async def research_company(domain: str) -> "ResearchResult":
                 company_profile.sub_industry or "",
             )
 
-    # ── Tavily fallback ───────────────────────────────────
     if not company_profile:
         print(f"[research] TDE unavailable — falling back to Tavily for {domain}")
         company_profile, industry_profile = await _tavily_research(domain)
         source = "tavily"
 
-    # ── Industry-only fallback (TDE gave company but not industry) ──
     if not industry_profile:
         industry_raw = await _industry_searches(company_profile.industry or "Technology")
         industry_profile = await _synthesize_industry(
