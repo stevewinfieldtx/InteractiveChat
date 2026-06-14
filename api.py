@@ -702,6 +702,10 @@ function renderResearch(job) {{
     const triggers = sc.buying_triggers || [];
     const objections = sc.common_objections || [];
     const trends = sc.industry_trends || [];
+    const tech = c.tech_stack_signals || [];
+    const comps = c.key_competitors || [];
+    const news = c.recent_news || [];
+    const notes = c.research_notes || '';
 
     status.textContent = '✅ Research Complete — ' + (c.company_name || job.domain);
     chatStatus.textContent = 'Research done for ' + job.domain;
@@ -716,6 +720,30 @@ function renderResearch(job) {{
         </div>
         ${{c.description ? `<p style="font-size:13px;color:#6b7280;margin-top:10px;line-height:1.6">${{c.description}}</p>` : ''}}
       </div>
+
+      ${{tech.length ? `
+      <div class="section">
+        <div class="section-label">Technology Stack</div>
+        ${{tech.map(t => `<span class="tag" style="background:rgba(99,102,241,.08);color:#818cf8;border-color:rgba(99,102,241,.2)">${{t}}</span>`).join('')}}
+      </div>` : ''}}
+
+      ${{comps.length ? `
+      <div class="section">
+        <div class="section-label">Key Competitors</div>
+        ${{comps.map(x => `<span class="tag" style="background:rgba(107,114,128,.08);color:#9ca3af;border-color:rgba(107,114,128,.2)">${{x}}</span>`).join('')}}
+      </div>` : ''}}
+
+      ${{notes ? `
+      <div class="section">
+        <div class="section-label">Partner Programs & Certifications</div>
+        <div style="font-size:12px;color:#94a3b8;line-height:1.7">${{notes}}</div>
+      </div>` : ''}}
+
+      ${{news.length ? `
+      <div class="section">
+        <div class="section-label">Recent News</div>
+        ${{news.slice(0,3).map(n => `<div style="font-size:12px;color:#6b7280;padding:5px 0;border-bottom:1px solid rgba(255,255,255,.05);line-height:1.5">▸ ${{n}}</div>`).join('')}}
+      </div>` : ''}}
 
       ${{pains.length ? `
       <div class="section">

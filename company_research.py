@@ -164,10 +164,22 @@ def _map_tde_company_full(row: dict, domain: str) -> CompanyProfile:
     comp = (sections.get("compete") or {}).get("data") or {}
     cust = (sections.get("customer") or {}).get("data") or {}
 
+    # Core data
     pain        = pp.get("company_pain_points") or pp.get("pain_points") or []
     tech        = pp.get("technology_stack") or cust.get("technology_stack") or []
     news        = cust.get("recent_news") or []
     competitors = comp.get("competitors") or []
+
+    # Rich intel from portfolio/competitive sections
+    target_customers  = _extract_strings(cust.get("target_customers") or [], "name", "type", "description")
+    products_services = _extract_strings(cust.get("products_services") or [], "name", "title", "description")
+    certifications    = _extract_strings(
+        (cust.get("certifications") or []) + (pp.get("certifications") or []),
+        "name", "title",
+    )
+    growth_signals    = _extract_strings(cust.get("growth_signals") or [], "title", "description")
+    market_position   = comp.get("market_position") or ""
+    strengths         = _extract_strings(comp.get("strengths") or [], "title", "description")
 
     filled = sum(bool(row.get(f)) for f in [
         "company_name", "industry", "sub_industry", "country", "website",
@@ -175,12 +187,32 @@ def _map_tde_company_full(row: dict, domain: str) -> CompanyProfile:
     has_sections = bool(pp or comp or cust)
     confidence = "high" if (filled >= 4 and has_sections) else "medium" if filled >= 2 else "low"
 
-    pain_strs = _extract_strings(pain, "title", "description")
+    # Build rich description: top-level description → market position → products → customers
+    desc_parts = []
+    if row.get("description"):
+        desc_parts.append(row["description"])
+    elif market_position:
+        desc_parts.append(market_position)
+    if products_services:
+        desc_parts.append("Offers: " + ", ".join(products_services[:3]))
+    if target_customers:
+        desc_parts.append("Serves: " + ", ".join(target_customers[:3]))
+    description = " | ".join(desc_parts) if desc_parts else ""
+
+    # Partner programs / certifications go into research_notes
+    notes_parts = []
+    if certifications:
+        notes_parts.append("Partner programs & certs: " + ", ".join(certifications[:6]))
+    if growth_signals:
+        notes_parts.append("Growth signals: " + "; ".join(growth_signals[:2]))
+    if strengths:
+        notes_parts.append("Strengths: " + "; ".join(strengths[:2]))
+    research_notes = " · ".join(notes_parts) if notes_parts else ""
 
     return CompanyProfile(
         domain=domain,
         company_name=row.get("company_name") or "",
-        description=cust.get("description") or "",
+        description=description,
         industry=row.get("industry") or "",
         sub_industry=row.get("sub_industry") or "",
         company_size="",
@@ -198,10 +230,7 @@ def _map_tde_company_full(row: dict, domain: str) -> CompanyProfile:
         ),
         linkedin_url=row.get("linkedin_url") or "",
         confidence=confidence,
-        research_notes=(
-            "Sourced from TDE swarm. Pain signals: "
-            + (", ".join(pain_strs[:2]) if pain_strs else "none extracted")
-        ),
+        research_notes=research_notes,
     )
 
 
@@ -230,7 +259,7 @@ def _map_tde_industry(d: dict, industry: str, sub_industry: str) -> IndustryProf
     )
 
 
-async def _tde_research_company(domain: str) -> Optional[CompanyProfile]:
+async def _tde_research_company(domain: str) -> tuple:
     """
     2-step TDE company research:
       Step 1: POST /intel/research/company  — triggers swarm if cache miss, saves rich data to DB.
@@ -238,10 +267,11 @@ async def _tde_research_company(domain: str) -> Optional[CompanyProfile]:
       Step 2: GET  /intel/company/:domain   — reads full rich data from DB (all sections).
 
     Timeout: 90s for step 1 (fresh research = 4 LLM agents + web fetch).
+    Returns: (CompanyProfile | None, buying_triggers: list)
     """
     if not TDE_URL:
         print("[TDE] TDE_API_URL not set — skipping TDE")
-        return None
+        return None, []
 
     headers = _tde_headers()
     payload = {"url": f"https://{domain}", "role": "partner", "name": ""}
@@ -255,7 +285,7 @@ async def _tde_research_company(domain: str) -> Optional[CompanyProfile]:
             )
             if r1.status_code != 200:
                 print(f"[TDE] POST research HTTP {r1.status_code} for {domain}: {r1.text[:300]}")
-                return None
+                return None, []
             src = r1.json().get("source", "?")
             print(f"[TDE] Step 1 done: source={src} for {domain}")
 
@@ -266,19 +296,26 @@ async def _tde_research_company(domain: str) -> Optional[CompanyProfile]:
             )
             if r2.status_code != 200:
                 print(f"[TDE] GET full data HTTP {r2.status_code} for {domain}: {r2.text[:200]}")
-                return None
+                return None, []
             full = r2.json()
             if not full.get("found"):
                 print(f"[TDE] GET returned found=false for {domain}")
-                return None
-            print(f"[TDE] Step 2 done: full intel for {domain} (sections: {list((full.get('sections') or {}).keys())})")
-            return _map_tde_company_full(full, domain)
+                return None, []
+
+            sections = full.get("sections") or {}
+            pp = (sections.get("painpoints") or {}).get("data") or {}
+            # Buying triggers live in the company's painpoints section
+            buying_triggers = _extract_strings(
+                pp.get("buying_triggers") or [], "trigger", "title", "description"
+            )
+            print(f"[TDE] Step 2 done: {domain} sections={list(sections.keys())} triggers={len(buying_triggers)}")
+            return _map_tde_company_full(full, domain), buying_triggers
 
     except httpx.TimeoutException:
         print(f"[TDE] Timeout (90s) researching {domain} — falling back to Tavily")
     except Exception as e:
         print(f"[TDE] Error researching {domain}: {e}")
-    return None
+    return None, []
 
 
 async def _tde_research_industry(industry: str, sub_industry: str) -> Optional[IndustryProfile]:
@@ -539,15 +576,19 @@ async def research_company(domain: str) -> ResearchResult:
 
     company_profile: Optional[CompanyProfile] = None
     industry_profile: Optional[IndustryProfile] = None
+    company_buying_triggers: list = []
 
     if TDE_URL:
-        company_profile = await _tde_research_company(domain)
+        company_profile, company_buying_triggers = await _tde_research_company(domain)
         if company_profile:
             source = "tde"
             industry_profile = await _tde_research_industry(
                 company_profile.industry or "Technology",
                 company_profile.sub_industry or "",
             )
+            # Seed buying_triggers from company-level painpoints data if industry didn't provide them
+            if industry_profile and not industry_profile.buying_triggers and company_buying_triggers:
+                industry_profile.buying_triggers = company_buying_triggers
 
     if not company_profile:
         print(f"[research] TDE unavailable — falling back to Tavily for {domain}")
