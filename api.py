@@ -591,55 +591,109 @@ async def demo_live():
 
 <div class="panels">
 
-  <!-- Panel 1: Demo Caller -->
+  <!-- Panel 1: Caller Background -->
   <div class="panel">
     <div class="panel-head">
       <div class="panel-title">Panel 1</div>
-      <div class="panel-status">📞 Demo Caller</div>
+      <div class="panel-status">🎭 Caller Background</div>
     </div>
-    <div class="panel-body">
+    <div class="panel-body" style="display:flex;flex-direction:column;gap:0">
 
-      <div style="margin-bottom:16px">
-        <div style="font-size:17px;font-weight:700;color:#f1f5f9">Alex Chen</div>
-        <div style="font-size:12px;color:#6b7280;margin-top:2px">PacificTech IT Solutions &middot; San Diego, CA</div>
-      </div>
-
-      <div class="section">
-        <div class="section-label">His Situation</div>
-        <div style="font-size:12px;color:#94a3b8;line-height:1.8">
-          &bull; ESET Advanced Partner &mdash; 4 years<br>
-          &bull; 22 SMB clients (~380 endpoints)<br>
-          &bull; Dental client phished 3 months ago<br>
-          &bull; Cyber insurance renewals forcing action<br>
-          &bull; ESET Inspect only on 4 of 22 clients
+      <div id="bg-card" style="flex:1">
+        <div style="text-align:center;color:#4b5563;font-size:13px;padding:40px 0">
+          Click the button below to get your caller identity.
         </div>
       </div>
 
-      <div class="section">
-        <div class="section-label">Pain Points to Unlock</div>
-        <div style="font-size:12px;color:#94a3b8;line-height:1.8">
-          &bull; No MDR &mdash; on call 24/7 for incidents<br>
-          &bull; M365 clients on default Defender only<br>
-          &bull; No cyber insurance offering for clients<br>
-          &bull; Lost a 30-seat deal to larger MSP<br>
-          &bull; Annual ESET revenue, wants MRR
-        </div>
-      </div>
+      <button onclick="newBackground()" style="
+        margin-top:auto;width:100%;padding:12px;
+        background:linear-gradient(135deg,#6366f1,#8b5cf6);
+        border:none;border-radius:8px;color:#fff;
+        font-size:13px;font-weight:700;letter-spacing:.04em;
+        cursor:pointer;transition:opacity .15s
+      " onmouseover="this.style.opacity='.85'" onmouseout="this.style.opacity='1'">
+        🎲 Click for Background
+      </button>
 
-      <div class="section" style="background:rgba(99,102,241,.06);border:1px solid rgba(99,102,241,.15);border-radius:8px;padding:12px">
-        <div style="font-size:11px;font-weight:700;color:#818cf8;letter-spacing:.08em;margin-bottom:8px">HOW TO RUN THE DEMO</div>
-        <div style="font-size:12px;color:#94a3b8;line-height:1.8">
-          <span style="color:#a78bfa">&#9654;</span> <strong style="color:#e2e8f0">Alex widget</strong> (bottom-left) &mdash; the prospect<br>
-          <span style="color:#a78bfa">&#9654;</span> <strong style="color:#e2e8f0">Guardz widget</strong> (bottom-right) &mdash; AI sales agent<br>
-          Start Alex first, then Guardz picks up the conversation.
-        </div>
-      </div>
-
-      <div id="chat-status" style="font-size:12px;color:#4b5563;text-align:center;padding:8px 0;margin-top:8px">
+      <div id="chat-status" style="font-size:11px;color:#4b5563;text-align:center;padding:6px 0">
         Waiting for conversation to start…
       </div>
     </div>
   </div>
+
+  <script>
+  const BG_POOL = [
+    { name:"Mike Torres", company:"TechForce IT Solutions", city:"Tampa, FL", email:"mike@techforceit.com",
+      selling:"Dental offices — 8 clients asking about cyber insurance compliance",
+      questions:["Does Guardz satisfy what cyber insurers are now requiring — EDR, email security, all of it?","Can I show a prospect their risk score before they sign with me?"] },
+    { name:"Sarah Kim", company:"BlueSky Systems", city:"Phoenix, AZ", email:"sarah@blueskysystems.com",
+      selling:"Law firms — worried about client data breach liability",
+      questions:["Does Guardz cover identity threats and email together in one platform?","What does onboarding look like for a 15-seat law firm?"] },
+    { name:"Dave Okonkwo", company:"PrecisionTech IT", city:"Houston, TX", email:"dave@precisiontechit.com",
+      selling:"CPA firms — clients asking about financial data protection",
+      questions:["My clients are mostly on Microsoft 365 — does Guardz handle M365 email security?","What's the margin like for a partner my size?"] },
+    { name:"Jennifer Walsh", company:"Walsh IT Services", city:"Chicago, IL", email:"jen@walshit.com",
+      selling:"Real estate agencies — handling sensitive client financial data",
+      questions:["Does Guardz include security awareness training and phishing simulation?","I'm not a security expert — how much do I need to know to sell this?"] },
+    { name:"Carlos Rivera", company:"RiverTech Solutions", city:"Miami, FL", email:"carlos@rivertechfl.com",
+      selling:"Small manufacturers — hit by ransomware last year, now paranoid",
+      questions:["What does the MDR piece actually mean — who's watching alerts at 2am?","Can Guardz prevent ransomware, or just detect it after the fact?"] },
+    { name:"Amanda Chu", company:"Summit IT Group", city:"Seattle, WA", email:"amanda@summitit.com",
+      selling:"Healthcare clinics — HIPAA compliance pressure increasing",
+      questions:["Does Guardz help clients meet HIPAA security requirements?","How does the cyber insurance piece work — do you broker it or just help qualify?"] },
+    { name:"Brian Murphy", company:"Murphy Networks", city:"Boston, MA", email:"brian@murphynetworks.com",
+      selling:"Financial services firms — regulators asking hard questions",
+      questions:["I'm losing deals to bigger MSPs with managed security. Can Guardz close that gap?","What's the partner program structure — tiers, margins, support?"] },
+    { name:"Lisa Patel", company:"Patel IT Consulting", city:"Dallas, TX", email:"lisa@patelitconsulting.com",
+      selling:"Construction companies — new to security, don't know where to start",
+      questions:["Can I manage all my clients from one dashboard?","How fast can I actually get a client up and running?"] },
+    { name:"Tom Nguyen", company:"NextWave IT", city:"Denver, CO", email:"tom@nextwaveit.com",
+      selling:"Accounting firms — clients storing sensitive tax data",
+      questions:["One of my clients just got a ransomware demand — could Guardz have prevented that?","Does Guardz work alongside existing tools or does it replace everything?"] },
+    { name:"Rachel Stevens", company:"Stevens Technology", city:"Atlanta, GA", email:"rachel@stevenstech.com",
+      selling:"Medical practices — patients asking about data security after hospital breaches in the news",
+      questions:["Does Guardz cover identity threat detection — like compromised employee accounts?","What's the pricing — per user, per client, flat rate?"] },
+    { name:"Kevin Park", company:"KP Systems", city:"San Jose, CA", email:"kevin@kpsystems.io",
+      selling:"Startups and small tech companies — SOC 2 compliance coming up",
+      questions:["Can Guardz help clients build the evidence they need for SOC 2 or cyber insurance audits?","Is there a free tier I can use to show a client before committing?"] },
+    { name:"Greg Henderson", company:"Delta IT Services", city:"Nashville, TN", email:"greg@deltait.com",
+      selling:"Insurance agencies — ironic that they have no security themselves",
+      questions:["How does the external footprint scanning work — does it find things clients don't know are exposed?","What kind of reporting can I give a client after a scan?"] },
+    { name:"Nikki Brown", company:"Brown Tech Consulting", city:"Portland, OR", email:"nikki@browntech.com",
+      selling:"Architecture and engineering firms — lots of intellectual property to protect",
+      questions:["Does Guardz protect against insider threats or just external attacks?","I currently use a patchwork of tools — what does Guardz actually replace?"] },
+    { name:"James Wilson", company:"Wilson IT Partners", city:"Charlotte, NC", email:"james@wilsonit.com",
+      selling:"Dental group practices — multiple locations, one IT partner",
+      questions:["Can I run one Guardz deployment across multiple client locations?","My clients keep asking me about cyber insurance — can Guardz help them qualify?"] },
+    { name:"Maria Santos", company:"Santos IT", city:"Orlando, FL", email:"maria@santosit.com",
+      selling:"Retail businesses — POS systems and customer payment data",
+      questions:["Does Guardz cover endpoint security or is it just monitoring?","I have clients who think they're too small to be targeted — how do I make the case?"] },
+  ];
+
+  let lastIdx = -1;
+
+  function newBackground() {{
+    let idx;
+    do {{ idx = Math.floor(Math.random() * BG_POOL.length); }} while (idx === lastIdx && BG_POOL.length > 1);
+    lastIdx = idx;
+    const p = BG_POOL[idx];
+    document.getElementById('bg-card').innerHTML = `
+      <div style="margin-bottom:14px">
+        <div style="font-size:17px;font-weight:700;color:#f1f5f9">${{p.name}}</div>
+        <div style="font-size:12px;color:#6b7280;margin-top:2px">${{p.company}} &middot; ${{p.city}}</div>
+        <div style="font-size:11px;color:#4b5563;margin-top:4px;font-family:monospace;background:rgba(255,255,255,.04);padding:3px 8px;border-radius:4px;display:inline-block">${{p.email}}</div>
+      </div>
+      <div class="section">
+        <div class="section-label">Selling Into</div>
+        <div style="font-size:12px;color:#94a3b8;line-height:1.6">${{p.selling}}</div>
+      </div>
+      <div class="section">
+        <div class="section-label">Ask These Questions</div>
+        ${{p.questions.map(q => `<div style="font-size:12px;color:#94a3b8;line-height:1.6;padding:5px 0;border-bottom:1px solid rgba(255,255,255,.05)">&rsaquo; ${{q}}</div>`).join('')}}
+      </div>
+    `;
+  }}
+  </script>
 
   <!-- Panel 2: Research -->
   <div class="panel">
@@ -671,16 +725,7 @@ async def demo_live():
 
 </div>
 
-<!-- Corner labels -->
-<div style="position:fixed;bottom:88px;left:20px;z-index:9999;background:#1e293b;border:1px solid #334155;border-radius:6px;padding:4px 10px;font-size:10px;font-weight:700;color:#818cf8;letter-spacing:.08em;pointer-events:none">ALEX — DEMO CALLER</div>
-<div style="position:fixed;bottom:88px;right:20px;z-index:9999;background:#1e293b;border:1px solid #334155;border-radius:6px;padding:4px 10px;font-size:10px;font-weight:700;color:#a78bfa;letter-spacing:.08em;pointer-events:none">GUARDZ AGENT</div>
-
-<!-- Alex Demo Caller Widget (bottom-left) -->
-<div style="position:fixed;bottom:20px;left:20px;z-index:9998">
-  <elevenlabs-convai agent-id="agent_9901kv2gdw2ffbh97wnj4awss9v5"></elevenlabs-convai>
-</div>
-
-<!-- Guardz Sales Agent Widget (bottom-right) -->
+<!-- Guardz Sales Agent Widget -->
 <elevenlabs-convai agent-id="{ELEVENLABS_AGENT_ID}"></elevenlabs-convai>
 <script src="https://elevenlabs.io/convai-widget/index.js" async type="text/javascript"></script>
 
