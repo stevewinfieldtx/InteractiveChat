@@ -15,6 +15,7 @@ Env vars:
 import asyncio
 import json
 import os
+import re
 from datetime import datetime
 from typing import Optional
 
@@ -614,9 +615,65 @@ async def research_company(domain: str) -> ResearchResult:
     return result
 
 
+async def research_industry(industry: str, sub_industry: str = "", customer_label: str = "") -> ResearchResult:
+    """
+    Research a CUSTOMER vertical/industry — the partner's end-client market.
+
+    This is the primary path for Rain Networks: the partner names a vertical
+    (dental offices, law firms, accounting, etc.) or a client, and we surface
+    that market's pain points, buying triggers, and compliance pressures so the
+    agent can show how Guardz fits the partner's customers.
+
+    No company domain required. TDE industry endpoint first, Tavily fallback.
+    """
+    start = datetime.utcnow()
+    industry = (industry or "Technology").strip()
+    sub_industry = (sub_industry or "").strip()
+    source = "tavily"
+
+    industry_profile: Optional[IndustryProfile] = None
+    if TDE_URL:
+        industry_profile = await _tde_research_industry(industry, sub_industry)
+        if industry_profile:
+            source = "tde"
+    if not industry_profile:
+        raw = await _industry_searches(industry)
+        industry_profile = await _synthesize_industry(industry, sub_industry, raw)
+
+    # Minimal company stub representing the target customer/vertical (not the partner).
+    label = (customer_label or f"{industry} clients").strip()
+    company = CompanyProfile(
+        domain=re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-") or "target-vertical",
+        company_name=label,
+        description=f"Target customer market for the partner: {industry}"
+                    + (f" / {sub_industry}" if sub_industry else ""),
+        industry=industry,
+        sub_industry=sub_industry,
+        confidence="low",  # routes resolve_sales_context to the industry-benchmark framing
+    )
+
+    result = ResearchResult(
+        domain=company.domain, company=company, industry=industry_profile,
+        duration_seconds=round((datetime.utcnow() - start).total_seconds(), 2),
+        source=source,
+    )
+    result.sales_context = resolve_sales_context(result)
+    return result
+
+
 # ──────────────────────────────────────────────────────────
 # Utility
 # ──────────────────────────────────────────────────────────
+
+def domain_from_url(url: str) -> str:
+    """Extract a bare domain from a website URL or loose hostname."""
+    u = (url or "").strip().lower()
+    u = re.sub(r"^https?://", "", u)
+    u = u.split("/")[0].split("?")[0].strip()
+    if u.startswith("www."):
+        u = u[4:]
+    return u
+
 
 def domain_from_email(email: str) -> str:
     FREE = {

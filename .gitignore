@@ -9,6 +9,9 @@ node_modules/
 **/.env
 **/.env.*
 !**/.env.example
+# Commented templates (placeholders only — safe to track)
+!.env.railway.example
+!**/.env.railway.example
 
 # Build output
 dist/

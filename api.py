@@ -4,6 +4,7 @@ api.py — Guardz Research Agent + Live Demo
 
 import asyncio
 import os
+import re
 from datetime import datetime
 
 import asyncpg
@@ -12,7 +13,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-from company_research import ResearchResult, domain_from_email, research_company
+from company_research import (
+    ResearchResult, domain_from_email, domain_from_url,
+    research_company, research_industry,
+)
 
 app = FastAPI(title="Guardz Research Agent", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -23,6 +27,22 @@ ELEVENLABS_API_KEY  = os.getenv("VITE_ELEVENLABS_API_KEY", os.getenv("ELEVENLABS
 OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL    = os.getenv("OPENROUTER_MODEL", "anthropic/claude-haiku-4-5")
 
+# ─── Email handoff config ─────────────────────────────────────────────────────
+# Who receives the handoff (the "sales team"). For now this is Steve.
+SALES_TEAM_EMAIL = os.getenv("SALES_TEAM_EMAIL", "stevewinfieldtx@gmail.com")
+SALES_REP_NAME   = os.getenv("SALES_REP_NAME", "Steve")
+# Sender. Resend's onboarding@resend.dev works with no domain verification for testing.
+EMAIL_FROM       = os.getenv("EMAIL_FROM", "Rain Networks <onboarding@resend.dev>")
+# Provider A — Resend (preferred, easiest): set RESEND_API_KEY.
+RESEND_API_KEY   = os.getenv("RESEND_API_KEY", "")
+# Provider B — SMTP (e.g. Gmail app password): set SMTP_HOST/USER/PASS.
+SMTP_HOST        = os.getenv("SMTP_HOST", "")
+SMTP_PORT        = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER        = os.getenv("SMTP_USER", "")
+SMTP_PASS        = os.getenv("SMTP_PASS", "")
+# Send the lightweight "are you available?" ping on the first buying signal.
+SEND_AVAILABILITY_PING = os.getenv("HANDOFF_SEND_AVAILABILITY", "true").lower() == "true"
+
 # ─── Demo state (in-memory, resets on redeploy) ───────────────────────────────
 
 _demo_jobs: list[dict] = []   # most-recent first, max 10
@@ -30,6 +50,8 @@ _demo_signals: list[dict] = []
 _live_transcript: list[dict] = []
 _active_conv_id: str = ""
 _transcript_task: asyncio.Task | None = None
+# Per-session handoff state so we ping availability once and email the brief once.
+_handoff_state: dict[str, dict] = {}
 
 def _upsert_demo_job(session_id: str, **fields):
     for job in _demo_jobs:
@@ -132,6 +154,11 @@ class ResearchRequest(BaseModel):
     email: str | None = None
     session_id: str = ""
     force_refresh: bool = False
+    # Customer-targeted research (Rain Networks: research the partner's CUSTOMER,
+    # not the partner). Provide an industry/vertical and/or a named client.
+    industry: str | None = None
+    customer_name: str | None = None
+    customer_website: str | None = None
 
 class ResearchStatusResponse(BaseModel):
     session_id: str
@@ -225,6 +252,28 @@ async def _run_research_job_no_db(domain: str, session_id: str):
         print(f"[research] Failed for {domain}: {e}")
 
 
+async def _run_customer_job(customer_domain: str, industry: str, customer_name: str, session_id: str):
+    """Research the partner's CUSTOMER — a named client (by website) or a vertical/industry."""
+    try:
+        if customer_domain:
+            result: ResearchResult = await research_company(customer_domain)
+        else:
+            result = await research_industry(industry or "Technology", "", customer_name or "")
+        sc = result.sales_context
+        _upsert_demo_job(
+            session_id,
+            status="done",
+            domain=result.domain,
+            company=result.company.model_dump(),
+            industry=result.industry.model_dump(),
+            sales_context=sc.model_dump() if sc else None,
+            duration_seconds=result.duration_seconds,
+        )
+    except Exception as e:
+        _upsert_demo_job(session_id, status="failed", error=str(e))
+        print(f"[customer-research] Failed ({customer_name or industry or customer_domain}): {e}")
+
+
 async def _run_research_job(job_id: int, domain: str, session_id: str):
     pool = await get_pool()
     await pool.execute(
@@ -262,6 +311,20 @@ async def _run_research_job(job_id: int, domain: str, session_id: str):
 
 @app.post("/research/company", response_model=ResearchStatusResponse)
 async def start_research(req: ResearchRequest, background_tasks: BackgroundTasks):
+    # ── Customer-targeted research (research the partner's CUSTOMER, not the partner) ──
+    if req.industry or req.customer_name or req.customer_website:
+        cust_domain = domain_from_url(req.customer_website) if req.customer_website else ""
+        label = req.customer_name or cust_domain or (req.industry or "target vertical")
+        _upsert_demo_job(
+            req.session_id, domain=label, status="running",
+            started_at=datetime.utcnow().isoformat(),
+            company=None, industry=None, sales_context=None,
+        )
+        background_tasks.add_task(
+            _run_customer_job, cust_domain, req.industry or "", req.customer_name or "", req.session_id
+        )
+        return ResearchStatusResponse(session_id=req.session_id, domain=label, status="pending")
+
     domain = req.domain or ""
     if not domain and req.email:
         domain = domain_from_email(req.email)
@@ -354,49 +417,58 @@ class NotifyHumanRequest(BaseModel):
     company_name: str = ""
     signal_type: str = "other"
     message: str = ""
+    # Optional — populated once the agent collects them for the callback handoff.
+    contact_email: str = ""
+    contact_phone: str = ""
 
 class NotifyHumanResponse(BaseModel):
     ok: bool
+    available: bool = False
+    rep_name: str = ""
     detail: str = ""
 
 
 async def _generate_sales_brief(
-    transcript: list, company: dict, sales_context: dict,
-    prospect_name: str, company_name: str
+    transcript: list, customer: dict, sales_context: dict,
+    partner_name: str, partner_company: str
 ) -> str:
-    """Call OpenRouter to produce a structured sales brief for Chad."""
+    """OpenRouter brief: help Steve (Rain Networks) close the PARTNER by speaking to their CUSTOMER's pains."""
     if not OPENROUTER_API_KEY or not transcript:
         return ""
     import httpx
 
     tx_lines = []
     for t in transcript:
-        role = "AGENT" if t.get("role") == "agent" else "CALLER"
+        role = "AGENT" if t.get("role") == "agent" else "PARTNER"
         tx_lines.append(f"{role}: {t.get('message','').strip()}")
     tx_text = "\n".join(tx_lines)
 
-    co = company or {}
+    cu = customer or {}
     ctx = sales_context or {}
-    company_ctx = ""
-    if co.get("company_name"):
-        company_ctx = (
-            f"Company: {co.get('company_name')} | "
-            f"Industry: {co.get('industry','')} | "
-            f"Size: {co.get('company_size','')} | "
-            f"Location: {co.get('hq_location','')}\n"
-            f"Description: {(co.get('description') or '')[:250]}"
+    market = cu.get("company_name") or ctx.get("industry") or ""
+    customer_ctx = ""
+    if market:
+        customer_ctx = (
+            f"Target market/vertical: {market}\n"
+            f"Industry: {cu.get('industry','') or ctx.get('industry','')}\n"
+            f"About: {(cu.get('description') or '')[:250]}"
         )
-    pains = ", ".join((ctx.get("pain_points") or [])[:3])
-    triggers = ", ".join((ctx.get("buying_triggers") or [])[:3])
+    pains = ", ".join((ctx.get("pain_points") or [])[:4])
+    triggers = ", ".join((ctx.get("buying_triggers") or [])[:4])
+    regs = ", ".join((ctx.get("regulatory_pressures") or [])[:3])
     if pains:
-        company_ctx += f"\nKnown pain points: {pains}"
+        customer_ctx += f"\nCustomer pain points: {pains}"
     if triggers:
-        company_ctx += f"\nBuying triggers: {triggers}"
+        customer_ctx += f"\nBuying triggers: {triggers}"
+    if regs:
+        customer_ctx += f"\nCompliance pressures: {regs}"
 
-    prompt = f"""You are a sales intelligence analyst briefing Chad, a human closer at Guardz, who is about to call a prospect right now. Be specific to THIS conversation. No generic advice.
+    prompt = f"""You are a sales intelligence analyst at Rain Networks, a Guardz distributor. You're briefing {SALES_REP_NAME}, who is about to call back a PARTNER (an IT reseller) that is evaluating Guardz to sell to THEIR customers. The win is showing how Guardz solves the partner's CUSTOMERS' problems. Be specific to THIS conversation. No generic advice.
 
-PROSPECT: {prospect_name or "Unknown"} at {company_name or "Unknown"}
-{company_ctx}
+PARTNER ({SALES_REP_NAME} is calling them back): {partner_name or "Unknown"} at {partner_company or "Unknown"}
+
+THEIR TARGET CUSTOMER MARKET (what Guardz must win for them):
+{customer_ctx or "(not yet identified — flag pinning this down as the first move)"}
 
 TRANSCRIPT:
 {tx_text}
@@ -412,15 +484,15 @@ INTENT SCORE
 [number 0-100]% — [one sentence: what signals drove this score]
 
 DIRECTION
-[1-2 sentences: where is this prospect in the journey and what are they about to do]
+[1-2 sentences: where the partner is in the journey and what they're about to do]
 
 BIGGEST CONCERN
-[The single clearest objection, worry, or blocker — quote their words if possible]
+[The single clearest objection or blocker — quote their words if possible]
 
-QUESTIONS FOR CHAD
-1. [Exact question to ask] — WHY: [what this unlocks or reveals]
-2. [Exact question to ask] — WHY: [what this unlocks or reveals]
-3. [Exact question to ask] — WHY: [what this unlocks or reveals]"""
+QUESTIONS FOR {SALES_REP_NAME.upper()}
+1. [Exact question to ask the partner] — WHY: [what this unlocks]
+2. [Exact question to ask the partner] — WHY: [what this unlocks]
+3. [Exact question to ask the partner] — WHY: [what this unlocks]"""
 
     try:
         async with httpx.AsyncClient(timeout=25.0) as client:
@@ -446,11 +518,240 @@ QUESTIONS FOR CHAD
         print(f"[brief] Error: {e}")
     return ""
 
+# ─── Email helpers ────────────────────────────────────────────────────────────
+
+_PHONE_RE = re.compile(r"(\+?\d[\d\-.\s()]{7,}\d)")
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+
+
+def _transcript_text(turns: list) -> str:
+    return "\n".join(f"{t.get('role','')}: {t.get('message','')}" for t in (turns or []))
+
+
+def _extract_phone(*sources) -> str:
+    """Find the first plausible phone number (10-15 digits) across the sources."""
+    for s in sources:
+        if not s:
+            continue
+        for m in _PHONE_RE.finditer(str(s)):
+            digits = re.sub(r"\D", "", m.group(1))
+            if 10 <= len(digits) <= 15:
+                return m.group(1).strip()
+    return ""
+
+
+def _extract_email(*sources) -> str:
+    for s in sources:
+        if not s:
+            continue
+        m = _EMAIL_RE.search(str(s))
+        if m:
+            return m.group(0).strip()
+    return ""
+
+
+def _html_to_text(html_str: str) -> str:
+    txt = re.sub(r"<[^>]+>", " ", html_str or "")
+    return re.sub(r"\s+", " ", txt).strip()
+
+
+def _smtp_send(to: str, subject: str, html_body: str, text_body: str):
+    import smtplib
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = EMAIL_FROM
+    msg["To"] = to
+    msg.attach(MIMEText(text_body or _html_to_text(html_body), "plain", "utf-8"))
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
+    sender = EMAIL_FROM.split("<")[-1].strip(">").strip() if "<" in EMAIL_FROM else EMAIL_FROM
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+        server.ehlo()
+        try:
+            server.starttls()
+            server.ehlo()
+        except Exception:
+            pass
+        server.login(SMTP_USER, SMTP_PASS)
+        server.sendmail(sender, [to], msg.as_string())
+
+
+async def send_email(to: str, subject: str, html_body: str, text_body: str = "") -> tuple:
+    """Send email via Resend (preferred) or SMTP. Returns (ok, detail)."""
+    if not to:
+        return False, "no recipient"
+    if RESEND_API_KEY:
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    "https://api.resend.com/emails",
+                    headers={"Authorization": f"Bearer {RESEND_API_KEY}",
+                             "Content-Type": "application/json"},
+                    json={"from": EMAIL_FROM, "to": [to], "subject": subject,
+                          "html": html_body, "text": text_body or _html_to_text(html_body)},
+                )
+            if resp.status_code in (200, 201):
+                return True, "sent via resend"
+            return False, f"resend {resp.status_code}: {resp.text[:160]}"
+        except Exception as e:
+            return False, f"resend error: {e}"
+    if SMTP_HOST and SMTP_USER and SMTP_PASS:
+        try:
+            await asyncio.to_thread(_smtp_send, to, subject, html_body, text_body)
+            return True, "sent via smtp"
+        except Exception as e:
+            return False, f"smtp error: {e}"
+    print(f"[email] No provider configured — would send to {to}: {subject}")
+    return False, "no email provider configured (set RESEND_API_KEY or SMTP_HOST/USER/PASS)"
+
+
+def _brief_to_html(brief_text: str) -> str:
+    import html as _h
+    if not brief_text:
+        return "<p style='color:#9ca3af;font-size:14px'>(AI brief unavailable — check OPENROUTER_API_KEY)</p>"
+    rows = []
+    for ln in brief_text.split("\n"):
+        s = ln.strip()
+        if not s:
+            rows.append("<div style='height:6px'></div>")
+            continue
+        esc = _h.escape(s)
+        if s.isupper() and len(s) <= 40:
+            rows.append(f"<div style='font-size:12px;font-weight:700;letter-spacing:.06em;color:#7c3aed;margin:14px 0 4px'>{esc}</div>")
+        else:
+            rows.append(f"<div style='font-size:14px;color:#1f2937;line-height:1.6;margin:2px 0'>{esc}</div>")
+    return "".join(rows)
+
+
+def _transcript_to_html(turns: list) -> str:
+    import html as _h
+    if not turns:
+        return "<p style='color:#9ca3af;font-size:14px'>(no transcript captured)</p>"
+    rows = []
+    for t in turns:
+        is_agent = t.get("role") == "agent"
+        who = "Agent" if is_agent else "Caller"
+        color = "#7c3aed" if is_agent else "#0ea5e9"
+        bg = "#f5f3ff" if is_agent else "#f0f9ff"
+        msg = _h.escape((t.get("message") or "").strip())
+        rows.append(
+            f"<div style='margin:6px 0;padding:8px 12px;background:{bg};border-left:3px solid {color};border-radius:4px'>"
+            f"<div style='font-size:11px;font-weight:700;color:{color};margin-bottom:2px'>{who}</div>"
+            f"<div style='font-size:14px;color:#1f2937;line-height:1.5'>{msg}</div></div>"
+        )
+    return "".join(rows)
+
+
+def _email_shell(inner: str) -> str:
+    return (
+        "<div style=\"font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;"
+        "max-width:640px;margin:0 auto;background:#ffffff;color:#1f2937;border:1px solid #eee;border-radius:10px;overflow:hidden\">"
+        f"{inner}</div>"
+    )
+
+
+def _section(label: str, body_html: str) -> str:
+    return (
+        "<div style='margin:18px 0'>"
+        f"<div style='font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#6b7280;margin-bottom:6px'>{label}</div>"
+        f"<div>{body_html}</div></div>"
+    )
+
+
+def _customer_to_html(customer: dict) -> str:
+    import html as _h
+    if not customer or not (customer.get("name") or customer.get("industry")):
+        return "<p style='color:#9ca3af;font-size:14px'>(not identified on the call — first thing to pin down)</p>"
+    title = customer.get("name") or customer.get("industry")
+    head = f"<div style='font-size:15px;color:#1f2937'><b>{_h.escape(str(title))}</b>"
+    if customer.get("industry") and customer.get("industry") != title:
+        head += f" <span style='color:#6b7280'>· {_h.escape(str(customer.get('industry')))}</span>"
+    head += "</div>"
+    def block(lbl, items, color):
+        items = [i for i in (items or []) if i]
+        if not items:
+            return ""
+        lis = "".join(f"<li style='margin:2px 0'>{_h.escape(str(x))}</li>" for x in items)
+        return (f"<div style='margin-top:10px'><div style='font-size:11px;font-weight:700;"
+                f"letter-spacing:.04em;color:{color}'>{lbl}</div>"
+                f"<ul style='margin:4px 0 0 18px;padding:0;font-size:13px;color:#1f2937;line-height:1.5'>{lis}</ul></div>")
+    return (head
+            + block("PAIN POINTS", customer.get("pains"), "#b91c1c")
+            + block("BUYING TRIGGERS", customer.get("triggers"), "#047857")
+            + block("COMPLIANCE PRESSURES", customer.get("regulations"), "#b45309"))
+
+
+def _build_availability_email(contact: dict, customer: dict, last_message: str, label: str) -> tuple:
+    import html as _h
+    name = _h.escape(contact.get("name") or "Unknown")
+    company = _h.escape(contact.get("company") or "Unknown partner")
+    target = customer.get("name") or customer.get("industry") or ""
+    subject = f"⚡ Partner ready for a call — are you free? ({contact.get('name') or 'Unknown'} @ {contact.get('company') or 'Unknown'})"
+    target_line = (f"<div style='font-size:14px;color:#1f2937;margin-top:4px'>Targeting: <b>{_h.escape(str(target))}</b></div>" if target else "")
+    inner = (
+        "<div style='background:#0d0d24;color:#fff;padding:20px 24px'>"
+        "<div style='font-size:13px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#a78bfa'>Rain Networks · Guardz Handoff</div>"
+        "<div style='font-size:20px;font-weight:800;margin-top:6px'>A partner looks ready to move</div></div>"
+        "<div style='padding:8px 24px 24px'>"
+        + _section("Partner", f"<div style='font-size:15px;color:#1f2937'><b>{name}</b> at <b>{company}</b></div>" + target_line)
+        + _section("Signal", f"<div style='font-size:14px;color:#1f2937'>{_h.escape(label)}</div>")
+        + _section("Last thing they said", f"<div style='font-size:14px;color:#1f2937;font-style:italic'>&ldquo;{_h.escape(last_message or '')}&rdquo;</div>")
+        + f"<div style='margin-top:16px;padding:14px 16px;background:#f5f3ff;border-radius:8px;font-size:14px;color:#4c1d95'>"
+          f"<b>{_h.escape(SALES_REP_NAME)}</b> — if you can take this, the AI is collecting the partner's callback number now. "
+          "A full brief with their number and their customers' pain points follows in a moment.</div>"
+        "</div>"
+    )
+    return subject, _email_shell(inner)
+
+
+def _build_handoff_email(contact: dict, customer: dict, last_message: str,
+                         brief_text: str, transcript: list, label: str) -> tuple:
+    import html as _h
+    name = contact.get("name") or "Unknown"
+    company = contact.get("company") or "Unknown partner"
+    email = contact.get("email") or "(not captured)"
+    phone = contact.get("phone") or "(not captured)"
+    subject = f"🔥 Call now: {name} @ {company} — callback {phone}"
+    contact_html = (
+        "<div style='font-size:14px;color:#1f2937;line-height:1.8'>"
+        f"<b>Name:</b> {_h.escape(name)}<br>"
+        f"<b>Partner / reseller:</b> {_h.escape(company)}<br>"
+        f"<b>Email:</b> {_h.escape(email)}<br>"
+        f"<b>Phone (call this):</b> <span style='font-size:17px;font-weight:700;color:#059669'>{_h.escape(phone)}</span>"
+        "</div>"
+    )
+    trigger_html = (
+        f"<div style='font-size:14px;color:#1f2937;font-style:italic'>&ldquo;{_h.escape(last_message or '')}&rdquo; "
+        f"<span style='color:#9ca3af;font-style:normal'>({_h.escape(label)})</span></div>"
+    )
+    inner = (
+        "<div style='background:#0d0d24;color:#fff;padding:20px 24px'>"
+        "<div style='font-size:13px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#a78bfa'>Rain Networks · Hot Handoff</div>"
+        f"<div style='font-size:20px;font-weight:800;margin-top:6px'>{_h.escape(SALES_REP_NAME)}, you're up — call this partner now</div></div>"
+        "<div style='padding:8px 24px 24px'>"
+        + _section("Contact (call the partner)", contact_html)
+        + _section("Customer / target vertical — the real target", _customer_to_html(customer))
+        + _section("What triggered the handoff", trigger_html)
+        + _section("AI Sales Brief", _brief_to_html(brief_text))
+        + _section(f"Transcript — last {len(transcript or [])} turns", _transcript_to_html(transcript))
+        + "</div>"
+    )
+    return subject, _email_shell(inner)
+
+
+# ─── Notify human (background-driven email + optional Slack) ───────────────────
+
+HANDOFF_SIGNALS = ("handoff_requested", "strong_interest", "demo_agreed",
+                   "named_client", "pricing_question", "how_to_start")
+
+
 @app.post("/notify/human", response_model=NotifyHumanResponse)
 async def notify_human(req: NotifyHumanRequest):
     label = SIGNAL_LABELS.get(req.signal_type, SIGNAL_LABELS["other"])
 
-    # Always track in demo state
+    # Always track in demo state (drives the live dashboard)
     _demo_signals.insert(0, {
         "session_id": req.session_id,
         "prospect_name": req.prospect_name,
@@ -463,29 +764,89 @@ async def notify_human(req: NotifyHumanRequest):
     if len(_demo_signals) > 20:
         _demo_signals.pop()
 
-    if not SLACK_WEBHOOK_URL:
-        return NotifyHumanResponse(ok=True, detail="SLACK_WEBHOOK_URL not configured")
+    # Heavy work (brief generation + email + Slack) runs in the background so the
+    # voice agent's tool call returns instantly and the web conversation never stalls.
+    asyncio.create_task(_process_notification(req, label))
 
-    # Determine if this is a handoff signal → generate full brief
-    is_handoff = req.signal_type in ("handoff_requested", "strong_interest", "demo_agreed", "named_client")
+    return NotifyHumanResponse(ok=True, available=True, rep_name=SALES_REP_NAME, detail="accepted")
+
+
+async def _process_notification(req: NotifyHumanRequest, label: str):
+    """Background worker: email handoff (availability ping + full brief) and optional Slack."""
+    try:
+        is_handoff = req.signal_type in HANDOFF_SIGNALS
+        transcript = list(_live_transcript)
+        job = _demo_jobs[0] if _demo_jobs else {}
+        customer_co = job.get("company") or {}      # the researched CUSTOMER (vertical/client), NOT the partner
+        sales_context = job.get("sales_context") or {}
+
+        # Partner = the reseller on the call, who Steve calls back.
+        recent_user_text = " ".join(
+            t.get("message", "") for t in transcript[-6:] if t.get("role") != "agent"
+        )
+        contact = {
+            "name": req.prospect_name or "",
+            "company": req.company_name or "",
+            "email": _extract_email(req.contact_email, req.message, _transcript_text(transcript)),
+            "phone": _extract_phone(req.contact_phone, req.message, recent_user_text),
+        }
+        # Customer / target vertical the partner wants to win — the real research payload.
+        customer = {
+            "name": customer_co.get("company_name") or sales_context.get("industry") or "",
+            "industry": customer_co.get("industry") or sales_context.get("industry") or "",
+            "pains": (sales_context.get("pain_points") or [])[:5],
+            "triggers": (sales_context.get("buying_triggers") or [])[:5],
+            "regulations": (sales_context.get("regulatory_pressures") or [])[:4],
+        }
+
+        # ── Email handoff ──────────────────────────────────────────────────────
+        if is_handoff:
+            st = _handoff_state.setdefault(
+                req.session_id or "default", {"availability_sent": False, "brief_sent": False})
+
+            if SEND_AVAILABILITY_PING and not st["availability_sent"]:
+                subj, html = _build_availability_email(contact, customer, req.message, label)
+                ok, detail = await send_email(SALES_TEAM_EMAIL, subj, html)
+                st["availability_sent"] = True
+                print(f"[handoff] availability email -> {SALES_TEAM_EMAIL}: ok={ok} ({detail})")
+
+            # Send the full brief once we have a callback number (the callback step),
+            # or immediately on an explicit handoff_requested signal.
+            ready_for_brief = bool(contact["phone"]) or req.signal_type == "handoff_requested"
+            if not st["brief_sent"] and ready_for_brief:
+                brief_text = await _generate_sales_brief(
+                    transcript=transcript, customer=customer_co, sales_context=sales_context,
+                    partner_name=contact["name"], partner_company=contact["company"],
+                )
+                subj, html = _build_handoff_email(
+                    contact=contact, customer=customer, last_message=req.message,
+                    brief_text=brief_text, transcript=transcript[-8:], label=label,
+                )
+                ok, detail = await send_email(SALES_TEAM_EMAIL, subj, html)
+                st["brief_sent"] = True
+                print(f"[handoff] brief email -> {SALES_TEAM_EMAIL}: ok={ok} ({detail})")
+
+        # ── Slack (optional, off unless SLACK_WEBHOOK_URL is set) ───────────────
+        if SLACK_WEBHOOK_URL:
+            await _post_slack(req, label, is_handoff, customer_co, sales_context, transcript)
+    except Exception as e:
+        print(f"[notify] worker error: {e}")
+
+
+async def _post_slack(req: NotifyHumanRequest, label: str, is_handoff: bool,
+                      customer_co: dict, sales_context: dict, transcript: list):
     brief_text = ""
     if is_handoff:
-        job = _demo_jobs[0] if _demo_jobs else {}
         brief_text = await _generate_sales_brief(
-            transcript=_live_transcript,
-            company=job.get("company") or {},
-            sales_context=job.get("sales_context") or {},
-            prospect_name=req.prospect_name,
-            company_name=req.company_name,
-        )
+            transcript=transcript, customer=customer_co, sales_context=sales_context,
+            partner_name=req.prospect_name, partner_company=req.company_name)
 
     convo_url = (f"https://elevenlabs.io/app/conversational-ai/conversations/{req.session_id}"
                  if req.session_id else "")
 
-    # ── Build Slack blocks ────────────────────────────────────────────────────
     if is_handoff:
         blocks = [
-            {"type":"header","text":{"type":"plain_text","text":"🔥 HANDOFF — Chad, you're up","emoji":True}},
+            {"type":"header","text":{"type":"plain_text","text":f"🔥 HANDOFF — {SALES_REP_NAME}, you're up","emoji":True}},
             {"type":"section","fields":[
                 {"type":"mrkdwn","text":f"*Prospect:*\n{req.prospect_name or '(not collected)'}"},
                 {"type":"mrkdwn","text":f"*Company:*\n{req.company_name or '(unknown)'}"},
@@ -493,18 +854,16 @@ async def notify_human(req: NotifyHumanRequest):
             {"type":"section","text":{"type":"mrkdwn","text":f"*Signal:* {label}\n*Last thing they said:*\n> {req.message or ''}"}},
         ]
         if brief_text:
-            # Split brief into sections for Slack (max 3000 chars per block)
             blocks.append({"type":"divider"})
             blocks.append({"type":"section","text":{"type":"mrkdwn","text":f"*📋 SALES BRIEF*\n```{brief_text[:2900]}```"}})
-        if _live_transcript:
+        if transcript:
             tx_lines = [f"{'🤖' if t.get('role')=='agent' else '👤'} {t.get('message','')[:120]}"
-                        for t in _live_transcript[-8:]]
+                        for t in transcript[-8:]]
             tx_preview = "\n".join(tx_lines)
             blocks.append({"type":"divider"})
             blocks.append({"type":"section","text":{"type":"mrkdwn",
-                "text":f"*📝 TRANSCRIPT (last {min(8,len(_live_transcript))} turns)*\n```{tx_preview[:2900]}```"}})
+                "text":f"*📝 TRANSCRIPT (last {min(8,len(transcript))} turns)*\n```{tx_preview[:2900]}```"}})
     else:
-        # Non-handoff signals — keep lightweight
         blocks = [
             {"type":"section","fields":[
                 {"type":"mrkdwn","text":f"*{label}*"},
@@ -524,9 +883,8 @@ async def notify_human(req: NotifyHumanRequest):
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(SLACK_WEBHOOK_URL, json={"text": fallback, "blocks": blocks})
             resp.raise_for_status()
-        return NotifyHumanResponse(ok=True)
     except Exception as e:
-        return NotifyHumanResponse(ok=False, detail=str(e))
+        print(f"[slack] error: {e}")
 
 
 
@@ -543,6 +901,7 @@ async def register_session(req: SessionRequest):
         return {"ok": True, "detail": "no change"}
     _active_conv_id = conv_id
     _live_transcript = []
+    _handoff_state.clear()
     if _transcript_task and not _transcript_task.done():
         _transcript_task.cancel()
     _transcript_task = asyncio.create_task(_poll_transcript(conv_id))
@@ -589,6 +948,7 @@ async def demo_reset():
     _demo_jobs.clear()
     _demo_signals.clear()
     _live_transcript.clear()
+    _handoff_state.clear()
     _active_conv_id = ""
     if _transcript_task and not _transcript_task.done():
         _transcript_task.cancel()
