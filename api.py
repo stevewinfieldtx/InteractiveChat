@@ -483,7 +483,7 @@ async def _generate_sales_brief(
     if regs:
         customer_ctx += f"\nCompliance pressures: {regs}"
 
-    prompt = f"""You are a sales intelligence analyst at Rain Networks, a Guardz distributor. You're briefing {SALES_REP_NAME}, who is about to call back a PARTNER (an IT reseller) that is evaluating Guardz to sell to THEIR customers. The win is showing how Guardz solves the partner's CUSTOMERS' problems. Be specific to THIS conversation. No generic advice.
+    prompt = f"""You are a sales intelligence analyst at Rain Networks, a Guardz distributor. You're briefing {SALES_REP_NAME}, who is about to call back a PARTNER (an IT reseller) that is evaluating Guardz to sell to THEIR customers. The win is showing how Guardz solves the partner's CUSTOMERS' problems. Be specific to THIS conversation. No generic advice. Use ONLY what the PARTNER actually said (the lines marked PARTNER below) — never credit them with a topic just because the AGENT raised it. If they did not actually express a given concern or interest, do not invent it; say it's not yet known. Quote the partner's own words where you can.
 
 PARTNER ({SALES_REP_NAME} is calling them back): {partner_name or "Unknown"} at {partner_company or "Unknown"}
 
