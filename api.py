@@ -970,6 +970,8 @@ async def register_session(req: SessionRequest):
     _active_conv_id = conv_id
     _live_transcript = []
     _handoff_state.clear()
+    _demo_jobs.clear()      # fresh slate on every new call — clear prior research...
+    _demo_signals.clear()   # ...and prior signals so old info never carries over
     if _transcript_task and not _transcript_task.done():
         _transcript_task.cancel()
     _transcript_task = asyncio.create_task(_poll_transcript(conv_id))
