@@ -1085,13 +1085,12 @@ async def _generate_copilot(messages: list) -> dict:
         "Return ONLY this JSON, no prose:\n"
         '{"health":"green|yellow|red","intent":<integer 0-100>,'
         '"tone":"<3-7 word read of the customer\'s mood/intent>",'
-        '"suggestion":"<a short, gentle nudge to the rep>"}\n\n'
-        "For \"suggestion\": coach the rep. Especially call out, gently, anything they SHOULD have "
-        "brought up but didn't — e.g. \"You didn't mention the free Community tier — raise it to ease "
-        "the price worry,\" or \"They mentioned 12 clients but you haven't asked which one to start "
-        "with,\" or \"Don't forget to grab their email.\" Do NOT write their reply for them; nudge so "
-        "they improve their OWN next response. If they handled it well, say so briefly and add the one "
-        "best next thing.\n\n"
+        '"tips":["<short bullet>","<short bullet>"]}\n\n'
+        "For \"tips\": 1-3 VERY SHORT bullets the rep can scan mid-chat — max ~10 words each, no full "
+        "sentences. Each bullet is a gap or a next move, e.g. \"Mention the free tier\", "
+        "\"Ask which client to start with\", \"You skipped the price worry\", \"Get their email\". "
+        "Especially flag anything they SHOULD have brought up but didn't. Do NOT write their reply for "
+        "them. If they nailed it, one bullet can affirm (e.g. \"Great expertise reassurance\").\n\n"
         "A strong rep ties Guardz to the clients' real pain (cyber-insurance pressure, ransomware), "
         "mentions the free Community tier + $5-15/user pricing, offers the risk report they can show "
         "clients, reassures 'you don't need to be a security expert,' asks how many clients / which to "
@@ -1127,10 +1126,12 @@ async def _post_copilot_slack(coach: dict, messages: list):
         return
     emoji = {"green": "🟢", "yellow": "🟡", "red": "🔴"}.get(coach.get("health", "yellow"), "🟡")
     last_cust = next((m["text"] for m in reversed(messages) if m.get("role") == "customer"), "")
+    tips = coach.get("tips") or ([coach["suggestion"]] if coach.get("suggestion") else [])
+    tips_txt = "\n".join(f"• {t}" for t in tips if t) or "•  —"
     text = (f"{emoji} *Call health: {coach.get('health','?')}*  ·  Intent {coach.get('intent','?')}%\n"
             f"*Read:* {coach.get('tone','')}\n"
-            f"*Customer just said:* {last_cust[:180]}\n"
-            f"*Coaching nudge:* {coach.get('suggestion','')}")
+            f"*Customer:* {last_cust[:160]}\n"
+            f"*Coaching:*\n{tips_txt}")
     try:
         import httpx
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -1149,6 +1150,93 @@ async def _run_copilot(session_id: str):
         await _post_copilot_slack(coach, chat["messages"])
 
 
+async def _generate_customer_reply(messages: list) -> str:
+    """AI plays the CUSTOMER (a reseller) and responds to the rep's actual words."""
+    if not OPENROUTER_API_KEY:
+        return ""
+    import httpx
+    convo = "\n".join(
+        f"{'REP' if m.get('role') == 'rep' else 'YOU'}: {m.get('text','')}"
+        for m in messages[-20:]
+    )
+    prompt = (
+        "You are role-playing the CUSTOMER in a live sales chat: an IT reseller / MSP owner exploring "
+        "whether to resell Guardz to your own SMB clients (dental offices, law firms, accountants). "
+        "Persona: busy, a little skeptical, price-sensitive, not a security expert, but genuinely "
+        "interested if it makes you money without being a hassle. Respond naturally to the REP's last "
+        "message in 1-3 short sentences, in character. Raise realistic concerns or objections when they "
+        "fit, and warm up as the rep addresses them. If there is no conversation yet, open with a "
+        "realistic first question about Guardz. Output ONLY your next line as the customer — no labels, "
+        "no quotes.\n\n"
+        f"CONVERSATION SO FAR:\n{convo if convo else '(none yet — you start)'}"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                         "HTTP-Referer": "https://interactivechat.up.railway.app",
+                         "X-Title": "Rain Networks Copilot"},
+                json={"model": OPENROUTER_MODEL, "messages": [{"role": "user", "content": prompt}],
+                      "max_tokens": 150, "temperature": 0.8},
+            )
+        if resp.status_code == 200:
+            return resp.json()["choices"][0]["message"]["content"].strip().strip('"')
+        print(f"[customer-sim] OpenRouter {resp.status_code}: {resp.text[:160]}")
+    except Exception as e:
+        print(f"[customer-sim] error: {e}")
+    return ""
+
+
+async def _customer_then_coach(sid: str):
+    """Generate the AI customer's reply, store it, then coach the rep on the exchange."""
+    chat = _chats.setdefault(sid, {"messages": [], "coach": {}})
+    reply = await _generate_customer_reply(chat["messages"])
+    if reply:
+        chat["messages"].append({"role": "customer", "text": reply,
+                                 "ts": datetime.utcnow().isoformat()})
+        if len(chat["messages"]) > 100:
+            chat["messages"] = chat["messages"][-100:]
+    await _run_copilot(sid)
+
+
+async def _generate_rep_reply(messages: list) -> str:
+    """Draft a strong rep reply for the human to EDIT before sending ('Respond for me')."""
+    if not OPENROUTER_API_KEY or not messages:
+        return ""
+    import httpx
+    convo = "\n".join(
+        f"{'YOU (rep)' if m.get('role') == 'rep' else 'CUSTOMER'}: {m.get('text','')}"
+        for m in messages[-20:]
+    )
+    prompt = (
+        "You are a top Rain Networks rep in a live chat with an IT reseller (the CUSTOMER) about "
+        "reselling Guardz to their SMB clients. Write your next reply to the customer's last message — "
+        "natural and concise (1-3 sentences), in a real rep's voice, moving the deal forward. Where it "
+        "fits: tie Guardz to the clients' real pain, mention the free Community tier / $5-15 per user, "
+        "offer the risk report they can show clients, reassure they don't need to be a security expert, "
+        "ask which client to start with, and work toward their email + a callback. "
+        "Output ONLY the reply text — no labels, no quotes.\n\n"
+        f"CONVERSATION:\n{convo}"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                         "HTTP-Referer": "https://interactivechat.up.railway.app",
+                         "X-Title": "Rain Networks Copilot"},
+                json={"model": OPENROUTER_MODEL, "messages": [{"role": "user", "content": prompt}],
+                      "max_tokens": 180, "temperature": 0.6},
+            )
+        if resp.status_code == 200:
+            return resp.json()["choices"][0]["message"]["content"].strip().strip('"')
+        print(f"[rep-suggest] OpenRouter {resp.status_code}: {resp.text[:160]}")
+    except Exception as e:
+        print(f"[rep-suggest] error: {e}")
+    return ""
+
+
 @app.post("/chat/send")
 async def chat_send(msg: ChatMessage, background_tasks: BackgroundTasks):
     sid = msg.session_id or "copilot"
@@ -1160,8 +1248,11 @@ async def chat_send(msg: ChatMessage, background_tasks: BackgroundTasks):
     chat["messages"].append({"role": role, "text": text, "ts": datetime.utcnow().isoformat()})
     if len(chat["messages"]) > 100:
         chat["messages"] = chat["messages"][-100:]
-    # Coach after EVERY turn — including the rep's own — so we can nudge on what they missed.
-    background_tasks.add_task(_run_copilot, sid)
+    if role == "rep":
+        # Rep spoke → AI customer responds to THEM, then coach on the exchange.
+        background_tasks.add_task(_customer_then_coach, sid)
+    else:
+        background_tasks.add_task(_run_copilot, sid)
     return {"ok": True, "count": len(chat["messages"])}
 
 
@@ -1175,6 +1266,20 @@ async def chat_state(session_id: str = "copilot"):
 async def chat_reset(session_id: str = "copilot"):
     _chats.pop(session_id, None)
     return {"ok": True}
+
+
+@app.post("/chat/customer-turn")
+async def chat_customer_turn(background_tasks: BackgroundTasks, session_id: str = "copilot"):
+    """Have the AI customer speak — an opening line, or a follow-up."""
+    background_tasks.add_task(_customer_then_coach, session_id)
+    return {"ok": True}
+
+
+@app.post("/chat/suggest-rep")
+async def chat_suggest_rep(session_id: str = "copilot"):
+    """Draft a rep reply for the human to edit before sending ('Respond for me')."""
+    chat = _chats.get(session_id, {"messages": []})
+    return {"suggestion": await _generate_rep_reply(chat.get("messages", []))}
 
 async def _poll_transcript(conversation_id: str):
     global _live_transcript
@@ -1340,7 +1445,7 @@ COPILOT_PAGE = """<!DOCTYPE html>
 <header>
  <span class="hlogo">Rain Networks &middot; AI Copilot</span>
  <div style="display:flex;gap:10px;align-items:center">
-   <button id="nextbtn" onclick="playNext()" style="font-size:13px;font-weight:700;color:#fff;background:linear-gradient(135deg,#7c3aed,#4f46e5);border:none;border-radius:8px;padding:7px 16px;cursor:pointer">&#9654; Next message</button>
+   <button id="startbtn" onclick="startDemo()" style="font-size:13px;font-weight:700;color:#fff;background:linear-gradient(135deg,#7c3aed,#4f46e5);border:none;border-radius:8px;padding:7px 16px;cursor:pointer">&#9654; Start (customer opens)</button>
    <button class="reset" onclick="resetChat()">Reset</button>
  </div>
 </header>
@@ -1353,7 +1458,7 @@ COPILOT_PAGE = """<!DOCTYPE html>
  <div class="col">
    <div class="col-h">Rep (you)</div>
    <div class="msgs" id="rep-msgs"></div>
-   <div class="inrow"><input id="rep-in" placeholder="Reply to the customer..." onkeydown="if(event.key==='Enter')send('rep')"><button onclick="send('rep')">Send</button></div>
+   <div class="inrow"><input id="rep-in" placeholder="Reply to the customer..." onkeydown="if(event.key==='Enter')send('rep')"><button id="respbtn" onclick="suggestRep()" style="background:rgba(124,58,237,.18);border:1px solid rgba(124,58,237,.45);color:#c4b5fd;font-weight:600">Respond for me</button><button onclick="send('rep')">Send</button></div>
  </div>
  <div class="cop">
    <div class="col-h" style="padding:0 0 12px">AI Copilot</div>
@@ -1367,26 +1472,9 @@ COPILOT_PAGE = """<!DOCTYPE html>
 <script>
 const SID='copilot';
 let lastSug='';
-let scriptIdx=0;
-// Rep lines are deliberately realistic-but-imperfect so the copilot can nudge the gaps.
-const SCRIPT=[
- {role:'customer',text:"Hey, I run a small IT shop — I support a bunch of dental offices. Someone said you do Guardz. What is it?"},
- {role:'rep',text:"It's an all-in-one security platform — email security, EDR, identity, all in one dashboard you manage for your clients."},
- {role:'customer',text:"Okay. A couple of them just got cyber insurance renewals demanding MFA and endpoint protection. Also, I'm not a security expert, and my clients are pretty cheap."},
- {role:'rep',text:"Don't worry, you don't need to be a security expert — Guardz handles the monitoring for you."},
- {role:'customer',text:"Yeah but the price is really my concern. They won't pay for yet another tool."},
- {role:'rep',text:"Totally fair — most partners just add it at five to fifteen a user on the existing contract, and clients say yes once they see their own risk report."},
- {role:'customer',text:"Huh, the risk report is interesting. I've got about twelve dental clients — I could probably start with one to test it."},
- {role:'rep',text:"Perfect — which client did you have in mind?"},
- {role:'customer',text:"Probably my biggest one, Bright Smile Dental. What's partner pricing, and how fast could I go live?"},
- {role:'rep',text:"Let me grab your best email and I'll have our partner specialist Steve walk you through pricing and onboarding — he can get Bright Smile live in about a day."}
-];
-async function playNext(){
-  const btn=document.getElementById('nextbtn');
-  if(scriptIdx>=SCRIPT.length){ btn.innerHTML='\\u2713 End of demo'; btn.disabled=true; return; }
-  const m=SCRIPT[scriptIdx++];
-  await fetch('/chat/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:SID,role:m.role,message:m.text})});
-  if(scriptIdx>=SCRIPT.length){ btn.innerHTML='\\u2713 End of demo'; btn.disabled=true; }
+async function startDemo(){
+  // AI customer opens the conversation; after that you (the rep) just reply and it responds.
+  await fetch('/chat/customer-turn?session_id='+SID,{method:'POST'});
   poll();
 }
 async function send(role){
@@ -1395,8 +1483,19 @@ async function send(role){
   await fetch('/chat/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:SID,role:role,message:t})});
   poll();
 }
+async function suggestRep(){
+  const inp=document.getElementById('rep-in');
+  const btn=document.getElementById('respbtn');
+  const old=btn.innerHTML; btn.innerHTML='Drafting...'; btn.disabled=true;
+  try{
+    const r=await fetch('/chat/suggest-rep?session_id='+SID,{method:'POST'});
+    const d=await r.json();
+    if(d&&d.suggestion){ inp.value=d.suggestion; inp.focus(); }
+  }catch(e){}
+  btn.innerHTML=old; btn.disabled=false;
+}
 function useSug(){ if(lastSug){ const r=document.getElementById('rep-in'); r.value=lastSug; r.focus(); } }
-async function resetChat(){ await fetch('/chat/reset?session_id='+SID); scriptIdx=0; const b=document.getElementById('nextbtn'); b.disabled=false; b.innerHTML='&#9654; Next message'; document.getElementById('cust-msgs').innerHTML=''; document.getElementById('rep-msgs').innerHTML=''; setCoach({}); }
+async function resetChat(){ await fetch('/chat/reset?session_id='+SID); document.getElementById('cust-msgs').innerHTML=''; document.getElementById('rep-msgs').innerHTML=''; setCoach({}); }
 function esc(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 function renderMsgs(el,msgs){ el.innerHTML=msgs.map(m=>'<div class="b '+m.role+'">'+esc(m.text)+'</div>').join(''); el.scrollTop=el.scrollHeight; }
 function setCoach(c){
@@ -1406,8 +1505,8 @@ function setCoach(c){
   document.getElementById('intent').textContent=(c.intent!=null?c.intent+'%':'\\u2014');
   document.getElementById('intentbar').style.width=(c.intent!=null?c.intent:0)+'%';
   document.getElementById('tone').textContent=c.tone||'Waiting for the customer...';
-  document.getElementById('sug').textContent=c.suggestion||'\\u2014';
-  lastSug=c.suggestion||'';
+  const tips=c.tips||(c.suggestion?[c.suggestion]:[]);
+  document.getElementById('sug').innerHTML = tips.length ? ('<ul style="margin:0;padding-left:18px">'+tips.map(t=>'<li style="margin:4px 0">'+esc(t)+'</li>').join('')+'</ul>') : '\\u2014';
 }
 async function poll(){
   try{
