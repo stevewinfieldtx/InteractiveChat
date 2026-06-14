@@ -1527,8 +1527,8 @@ COPILOT_PAGE = """<!DOCTYPE html>
  .b { max-width:85%; padding:8px 12px; border-radius:10px; font-size:13px; line-height:1.5 }
  .b.customer { align-self:flex-start; background:rgba(16,185,129,.13); border:1px solid rgba(16,185,129,.32); color:#a7f3d0 }
  .b.rep { align-self:flex-end; background:rgba(167,139,250,.16); border:1px solid rgba(167,139,250,.34); color:#ddd6fe }
- .inrow { display:flex; gap:8px; padding:12px; border-top:1px solid rgba(255,255,255,.06) }
- .inrow input { flex:1; background:rgba(255,255,255,.05); border:1px solid rgba(255,255,255,.1); border-radius:8px; padding:9px 12px; color:#fff; font-size:13px; outline:none }
+ .inrow { display:flex; gap:8px; padding:12px; border-top:1px solid rgba(255,255,255,.06); align-items:flex-end }
+ .inrow input, .inrow textarea { flex:1; background:rgba(255,255,255,.05); border:1px solid rgba(255,255,255,.1); border-radius:8px; padding:9px 12px; color:#fff; font-size:13px; font-family:inherit; line-height:1.45; outline:none; resize:none; overflow-y:auto; max-height:220px }
  .inrow button { background:linear-gradient(135deg,#7c3aed,#4f46e5); border:none; border-radius:8px; color:#fff; font-size:13px; font-weight:700; padding:9px 14px; cursor:pointer }
  .cop { background:#0d0d24; padding:16px; overflow-y:auto }
  .light { display:flex; align-items:center; gap:14px; margin-bottom:18px }
@@ -1558,7 +1558,7 @@ COPILOT_PAGE = """<!DOCTYPE html>
  <div class="col">
    <div class="col-h">Conversation &mdash; <span style="color:#a7f3d0">customer</span> &middot; <span style="color:#c4b5fd">rep (you)</span></div>
    <div class="msgs" id="convo-msgs"></div>
-   <div class="inrow"><input id="rep-in" placeholder="Reply to the customer..." onkeydown="if(event.key==='Enter')send('rep')"><button id="respbtn" onclick="suggestRep()" style="background:rgba(124,58,237,.18);border:1px solid rgba(124,58,237,.45);color:#c4b5fd;font-weight:600">Respond for me</button><button onclick="send('rep')">Send</button></div>
+   <div class="inrow"><textarea id="rep-in" rows="2" placeholder="Reply to the customer..." oninput="autogrow(this)" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();send('rep')}"></textarea><button id="respbtn" onclick="suggestRep()" style="background:rgba(124,58,237,.18);border:1px solid rgba(124,58,237,.45);color:#c4b5fd;font-weight:600">Respond for me</button><button onclick="send('rep')">Send</button></div>
  </div>
  <div class="cop">
    <div class="col-h" style="padding:0 0 12px">AI Copilot</div>
@@ -1579,7 +1579,7 @@ async function startDemo(){
 }
 async function send(role){
   const inp=document.getElementById('rep-in');
-  const t=(inp.value||'').trim(); if(!t)return; inp.value='';
+  const t=(inp.value||'').trim(); if(!t)return; inp.value=''; autogrow(inp);
   await fetch('/chat/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:SID,role:role||'rep',message:t,simulate:true})});
   poll();
 }
@@ -1590,13 +1590,14 @@ async function suggestRep(){
   try{
     const r=await fetch('/chat/suggest-rep?session_id='+SID,{method:'POST'});
     const d=await r.json();
-    if(d&&d.suggestion){ inp.value=d.suggestion; inp.focus(); }
+    if(d&&d.suggestion){ inp.value=d.suggestion; inp.focus(); autogrow(inp); }
   }catch(e){}
   btn.innerHTML=old; btn.disabled=false;
 }
 function useSug(){ if(lastSug){ const r=document.getElementById('rep-in'); r.value=lastSug; r.focus(); } }
 async function resetChat(){ await fetch('/chat/reset?session_id='+SID); document.getElementById('convo-msgs').innerHTML=''; setCoach({}); }
 function esc(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function autogrow(el){ if(!el)return; el.style.height='auto'; el.style.height=Math.min(el.scrollHeight,220)+'px'; }
 function renderMsgs(el,msgs){ el.innerHTML=msgs.map(m=>'<div class="b '+m.role+'">'+esc(m.text)+'</div>').join(''); el.scrollTop=el.scrollHeight; }
 function setCoach(c){
   const h=c.health||''; const dot=document.getElementById('dot');
@@ -1644,8 +1645,8 @@ AGENT_PAGE = """<!DOCTYPE html>
  .b { max-width:85%; padding:8px 12px; border-radius:10px; font-size:13px; line-height:1.5 }
  .b.customer { align-self:flex-start; background:rgba(16,185,129,.13); border:1px solid rgba(16,185,129,.32); color:#a7f3d0 }
  .b.rep { align-self:flex-end; background:rgba(167,139,250,.16); border:1px solid rgba(167,139,250,.34); color:#ddd6fe }
- .inrow { display:flex; gap:8px; padding:12px; border-top:1px solid rgba(255,255,255,.06) }
- .inrow input { flex:1; background:rgba(255,255,255,.05); border:1px solid rgba(255,255,255,.1); border-radius:8px; padding:9px 12px; color:#fff; font-size:13px; outline:none }
+ .inrow { display:flex; gap:8px; padding:12px; border-top:1px solid rgba(255,255,255,.06); align-items:flex-end }
+ .inrow input, .inrow textarea { flex:1; background:rgba(255,255,255,.05); border:1px solid rgba(255,255,255,.1); border-radius:8px; padding:9px 12px; color:#fff; font-size:13px; font-family:inherit; line-height:1.45; outline:none; resize:none; overflow-y:auto; max-height:220px }
  .inrow button { background:linear-gradient(135deg,#7c3aed,#4f46e5); border:none; border-radius:8px; color:#fff; font-size:13px; font-weight:700; padding:9px 14px; cursor:pointer }
  .cop { background:#0d0d24; padding:16px; overflow-y:auto }
  .light { display:flex; align-items:center; gap:14px; margin-bottom:18px }
@@ -1667,7 +1668,7 @@ AGENT_PAGE = """<!DOCTYPE html>
  <div class="col">
    <div class="col-h">Live chat &mdash; <span style="color:#a7f3d0">visitor</span> &middot; <span style="color:#c4b5fd">you (rep)</span></div>
    <div class="msgs" id="convo-msgs"></div>
-   <div class="inrow"><input id="rep-in" placeholder="Answer the visitor..." onkeydown="if(event.key==='Enter')send()"><button id="respbtn" onclick="suggestRep()" style="background:rgba(124,58,237,.18);border:1px solid rgba(124,58,237,.45);color:#c4b5fd;font-weight:600">Respond for me</button><button onclick="send()">Send</button></div>
+   <div class="inrow"><textarea id="rep-in" rows="2" placeholder="Answer the visitor..." oninput="autogrow(this)" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();send()}"></textarea><button id="respbtn" onclick="suggestRep()" style="background:rgba(124,58,237,.18);border:1px solid rgba(124,58,237,.45);color:#c4b5fd;font-weight:600">Respond for me</button><button onclick="send()">Send</button></div>
  </div>
  <div class="cop">
    <div class="col-h" style="padding:0 0 12px">AI Copilot</div>
@@ -1681,6 +1682,7 @@ AGENT_PAGE = """<!DOCTYPE html>
 const SID=(new URLSearchParams(location.search)).get('session')||'guardz-live';
 document.getElementById('sesslabel').textContent=SID;
 function esc(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function autogrow(el){ if(!el)return; el.style.height='auto'; el.style.height=Math.min(el.scrollHeight,220)+'px'; }
 function renderMsgs(el,msgs){ el.innerHTML=msgs.map(m=>'<div class="b '+(m.role==='customer'?'customer':'rep')+'">'+esc(m.text)+'</div>').join(''); el.scrollTop=el.scrollHeight; }
 function setCoach(c){
   const h=c.health||''; const dot=document.getElementById('dot'); dot.className='dot'+(h?(' '+h):'');
@@ -1692,14 +1694,14 @@ function setCoach(c){
   document.getElementById('sug').innerHTML = tips.length ? ('<ul style="margin:0;padding-left:18px">'+tips.map(t=>'<li style="margin:4px 0">'+esc(t)+'</li>').join('')+'</ul>') : '\\u2014';
 }
 async function send(){
-  const inp=document.getElementById('rep-in'); const t=(inp.value||'').trim(); if(!t)return; inp.value='';
+  const inp=document.getElementById('rep-in'); const t=(inp.value||'').trim(); if(!t)return; inp.value=''; autogrow(inp);
   await fetch('/chat/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:SID,role:'rep',message:t})});
   poll();
 }
 async function suggestRep(){
   const inp=document.getElementById('rep-in'); const btn=document.getElementById('respbtn');
   const old=btn.innerHTML; btn.innerHTML='Drafting...'; btn.disabled=true;
-  try{ const r=await fetch('/chat/suggest-rep?session_id='+encodeURIComponent(SID),{method:'POST'}); const d=await r.json(); if(d&&d.suggestion){ inp.value=d.suggestion; inp.focus(); } }catch(e){}
+  try{ const r=await fetch('/chat/suggest-rep?session_id='+encodeURIComponent(SID),{method:'POST'}); const d=await r.json(); if(d&&d.suggestion){ inp.value=d.suggestion; inp.focus(); autogrow(inp); } }catch(e){}
   btn.innerHTML=old; btn.disabled=false;
 }
 async function poll(){
