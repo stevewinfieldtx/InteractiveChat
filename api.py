@@ -19,7 +19,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 ELEVENLABS_AGENT_ID = os.getenv("ELEVENLABS_AGENT_ID", "agent_5101kty2ztmme25aspqycwp7mpsm")
-ELEVENLABS_API_KEY  = os.getenv("ELEVENLABS_API_KEY", "")
+ELEVENLABS_API_KEY  = os.getenv("VITE_ELEVENLABS_API_KEY", os.getenv("ELEVENLABS_API_KEY", ""))
 
 # ─── Demo state (in-memory, resets on redeploy) ───────────────────────────────
 
