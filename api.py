@@ -42,6 +42,9 @@ SMTP_USER        = os.getenv("SMTP_USER", "")
 SMTP_PASS        = os.getenv("SMTP_PASS", "")
 # Send the lightweight "are you available?" ping on the first buying signal.
 SEND_AVAILABILITY_PING = os.getenv("HANDOFF_SEND_AVAILABILITY", "true").lower() == "true"
+# Live chat handoff: ping the team, then let the AI take over if no human answers in time.
+GUARDZ_HUMAN_WAIT_SECONDS = int(os.getenv("GUARDZ_HUMAN_WAIT_SECONDS", "60"))
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://interactivechat.up.railway.app")
 
 # ─── Demo state (in-memory, resets on redeploy) ───────────────────────────────
 
@@ -1067,6 +1070,7 @@ class ChatMessage(BaseModel):
     role: str = "customer"   # "customer" or "rep"
     message: str = ""
     simulate: bool = False   # demo only: AI plays the customer. LIVE leaves this false (real visitor).
+    wait: int = 0            # optional per-chat override of the human-wait window (seconds); 0 = default
 
 
 async def _generate_copilot(messages: list) -> dict:
@@ -1254,18 +1258,88 @@ async def chat_send(msg: ChatMessage, background_tasks: BackgroundTasks):
     if len(chat["messages"]) > 100:
         chat["messages"] = chat["messages"][-100:]
     if role == "rep" and msg.simulate:
-        # DEMO: AI plays the customer and responds to the rep, then coach.
+        # DEMO (/copilot): AI plays the customer and responds to the rep, then coach.
         background_tasks.add_task(_customer_then_coach, sid)
-    else:
-        # LIVE: real visitor on the other end — just coach the rep (no AI customer).
+        return {"ok": True, "count": len(chat["messages"])}
+
+    if role == "rep":
+        # LIVE rep answered → they've claimed this chat; AI will not take over.
+        chat["human_active"] = True
         background_tasks.add_task(_run_copilot, sid)
+        return {"ok": True, "count": len(chat["messages"])}
+
+    # role == "customer" — a real visitor.
+    background_tasks.add_task(_run_copilot, sid)            # keep coaching ready for a human
+    if not chat.get("slack_pinged"):                       # first message → ping team + start timer
+        chat["slack_pinged"] = True
+        chat["started_at"] = datetime.utcnow().isoformat()
+        wait = msg.wait if (msg.wait and msg.wait > 0) else GUARDZ_HUMAN_WAIT_SECONDS
+        background_tasks.add_task(_ping_team_slack, sid, text, wait)
+        asyncio.create_task(_ai_fallback_after(sid, wait))
+    if chat.get("ai_active"):                              # AI already took over → it keeps replying
+        background_tasks.add_task(_guardz_then_capture, sid)
     return {"ok": True, "count": len(chat["messages"])}
+
+
+async def _guardz_then_capture(sid: str):
+    """AI generates a reply for the live visitor (fallback mode), then captures the lead."""
+    chat = _chats.get(sid)
+    if not chat:
+        return
+    reply = await _generate_guardz_reply(chat["messages"])
+    if reply:
+        chat["messages"].append({"role": "agent", "text": reply, "ts": datetime.utcnow().isoformat()})
+    await _guardz_capture(sid)
+
+
+async def _ping_team_slack(sid: str, first_msg: str, wait: int):
+    """Ping the sales team that a visitor wants to chat, with a one-click claim link."""
+    link = f"{PUBLIC_BASE_URL}/agent?session={sid}"
+    if not SLACK_WEBHOOK_URL:
+        print(f"[team-ping] (no SLACK_WEBHOOK_URL) new chat {sid}: {first_msg[:80]} | claim: {link}")
+        return
+    text = (f"🟢 *New Guardz chat* — a visitor wants to talk.\n> {first_msg[:200]}\n"
+            f"*Claim it (first to reply takes it):* {link}\n"
+            f"_AI takes over in ~{wait}s if no one grabs it._")
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(SLACK_WEBHOOK_URL, json={"text": text})
+    except Exception as e:
+        print(f"[team-ping] {e}")
+
+
+async def _ai_fallback_after(sid: str, wait: int):
+    """If no human has claimed the chat within the window, let the AI take over."""
+    try:
+        await asyncio.sleep(max(1, wait))
+        chat = _chats.get(sid)
+        if not chat or chat.get("human_active") or chat.get("ai_active"):
+            return
+        chat["ai_active"] = True
+        reply = await _generate_guardz_reply(chat["messages"])
+        intro = ("Thanks for your patience! Our specialists are all tied up right now, so I'll jump in "
+                 "directly — I'm the Guardz AI assistant. ")
+        chat["messages"].append({"role": "agent",
+                                 "text": intro + (reply or "What can I tell you about Guardz?"),
+                                 "ts": datetime.utcnow().isoformat()})
+        await _guardz_capture(sid)
+    except Exception as e:
+        print(f"[ai-fallback] {e}")
 
 
 @app.get("/chat/state")
 async def chat_state(session_id: str = "copilot"):
     chat = _chats.get(session_id, {"messages": [], "coach": {}})
-    return {"messages": chat.get("messages", []), "coach": chat.get("coach", {})}
+    if chat.get("human_active"):
+        mode = "human"
+    elif chat.get("ai_active"):
+        mode = "ai"
+    elif chat.get("slack_pinged"):
+        mode = "waiting"
+    else:
+        mode = "idle"
+    return {"messages": chat.get("messages", []), "coach": chat.get("coach", {}), "mode": mode}
 
 
 @app.get("/chat/reset")
@@ -1662,7 +1736,7 @@ AGENT_PAGE = """<!DOCTYPE html>
 <body>
 <header>
  <span class="hlogo">Rain Networks &middot; Agent Console</span>
- <span class="sess">session: <b id="sesslabel"></b></span>
+ <span class="sess"><b id="modebadge" style="color:#a78bfa"></b> &nbsp; session: <b id="sesslabel"></b></span>
 </header>
 <div class="wrap">
  <div class="col">
@@ -1707,6 +1781,7 @@ async function suggestRep(){
 async function poll(){
   try{ const r=await fetch('/chat/state?session_id='+encodeURIComponent(SID)); const d=await r.json();
     renderMsgs(document.getElementById('convo-msgs'), d.messages||[]); setCoach(d.coach||{});
+    const mb=document.getElementById('modebadge'); if(mb){ const M={idle:'no visitor yet',waiting:'\\u23F3 visitor waiting \\u2014 reply to claim',human:'\\u2713 you are connected',ai:'\\uD83E\\uDD16 AI took over'}; mb.textContent=M[d.mode]||''; }
   }catch(e){}
 }
 setInterval(poll,1500); poll();
@@ -1717,6 +1792,50 @@ setInterval(poll,1500); poll();
 @app.get("/agent", response_class=HTMLResponse)
 async def agent_console():
     return HTMLResponse(AGENT_PAGE)
+
+
+# Standalone visitor surface — mirrors the website's GuardzChat widget, for testing /agent
+# without deploying the site. Open /visitor (be the customer) + /agent (be the rep), same session.
+VISITOR_PAGE = """<!DOCTYPE html><html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Guardz — Chat with a specialist</title>
+<style>
+ *{box-sizing:border-box;margin:0;padding:0}
+ html,body{height:100%;background:#080818;color:#fff;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
+ .wrap{max-width:640px;margin:0 auto;height:100vh;display:flex;flex-direction:column}
+ .hd{padding:16px 20px;border-bottom:1px solid rgba(255,255,255,.08);display:flex;align-items:center;gap:10px}
+ .dot{height:9px;width:9px;border-radius:50%;background:#10b981;animation:p 1.5s infinite}
+ @keyframes p{0%,100%{opacity:1}50%{opacity:.4}}
+ .hd b{font-size:14px}.hd small{display:block;color:#6b7280;font-size:12px}
+ .msgs{flex:1;overflow-y:auto;padding:18px;display:flex;flex-direction:column;gap:10px}
+ .b{max-width:80%;padding:9px 13px;border-radius:12px;font-size:14px;line-height:1.5}
+ .me{align-self:flex-end;background:rgba(124,58,237,.2);border:1px solid rgba(124,58,237,.3);color:#ddd6fe}
+ .them{align-self:flex-start;background:rgba(16,185,129,.12);border:1px solid rgba(16,185,129,.3);color:#a7f3d0}
+ .inrow{display:flex;gap:8px;padding:14px;border-top:1px solid rgba(255,255,255,.08)}
+ .inrow input{flex:1;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.12);border-radius:10px;padding:11px 14px;color:#fff;font-size:14px;outline:none}
+ .inrow button{background:linear-gradient(135deg,#7c3aed,#4f46e5);border:none;border-radius:10px;color:#fff;font-weight:700;padding:11px 18px;cursor:pointer}
+</style></head><body>
+<div class="wrap">
+ <div class="hd"><span class="dot"></span><div><b>Chat with a Guardz specialist</b><small id="status">Ask anything — a real person replies here.</small></div></div>
+ <div class="msgs" id="m"></div>
+ <div class="inrow"><input id="i" placeholder="Type your question..." onkeydown="if(event.key==='Enter')send()"><button onclick="send()">Send</button></div>
+</div>
+<script>
+const P=new URLSearchParams(location.search);
+const SID=P.get('session')||'guardz-live';
+const WAIT=parseInt(P.get('wait')||'0',10)||0;
+const STAT={idle:'Ask anything — a real person replies here.',waiting:'\\u23F3 Connecting you with a specialist…',human:'\\u2713 Specialist connected',ai:'\\uD83E\\uDD16 Guardz AI assistant — happy to help'};
+function esc(s){return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function render(msgs){const m=document.getElementById('m');m.innerHTML=(msgs||[]).map(x=>'<div class="b '+(x.role==='customer'?'me':'them')+'">'+esc(x.text)+'</div>').join('');m.scrollTop=m.scrollHeight;}
+async function send(){const i=document.getElementById('i');const t=(i.value||'').trim();if(!t)return;i.value='';await fetch('/chat/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:SID,role:'customer',message:t,wait:WAIT})});poll();}
+async function poll(){try{const r=await fetch('/chat/state?session_id='+encodeURIComponent(SID));const d=await r.json();render(d.messages);const s=document.getElementById('status');if(s)s.textContent=STAT[d.mode]||STAT.idle;}catch(e){}}
+setInterval(poll,1500);poll();
+</script></body></html>"""
+
+
+@app.get("/visitor", response_class=HTMLResponse)
+async def visitor_page():
+    return HTMLResponse(VISITOR_PAGE)
 
 
 # Live-call script (plain string — NOT an f-string, so JS braces stay literal).
