@@ -1005,16 +1005,28 @@ async def register_session(req: SessionRequest):
     print(f"[session] Registered {conv_id} (live transcript via client push)")
     return {"ok": True, "conversation_id": conv_id}
 
+# Phantom speech filter: STT produces these from echo/ambient noise
+_PHANTOM_WORDS = {
+    "okay", "ok", "uh-huh", "uh huh", "um", "uh", "hmm", "mm",
+    "mhm", "mm-hmm", "yeah", "yep", "right", "sure", "bye",
+    "hello", "hi", "hey", "thanks", "thank you",
+}
+
 @app.post("/demo/transcript")
 async def add_transcript(turn: TranscriptTurn):
     """Browser pushes each finalized turn here in real time (drives the brief + leads)."""
     global _live_transcript
     msg = (turn.message or "").strip()
-    if msg:
-        role = "agent" if turn.role in ("agent", "ai") else "user"
-        _live_transcript.append({"role": role, "message": msg})
-        if len(_live_transcript) > 200:
-            _live_transcript = _live_transcript[-200:]
+    if not msg:
+        return {"ok": True, "turns": len(_live_transcript)}
+    role = "agent" if turn.role in ("agent", "ai") else "user"
+    # Skip likely phantom/echo artifacts from the caller side
+    if role == "user" and msg.lower().rstrip(".!?,") in _PHANTOM_WORDS:
+        print(f"[transcript] Filtered phantom: '{msg}'")
+        return {"ok": True, "turns": len(_live_transcript), "filtered": True}
+    _live_transcript.append({"role": role, "message": msg})
+    if len(_live_transcript) > 200:
+        _live_transcript = _live_transcript[-200:]
     return {"ok": True, "turns": len(_live_transcript)}
 
 
@@ -1914,6 +1926,7 @@ async function toggleCall() {
     if (b) b.innerHTML = '';
     convSession = await Conversation.startSession({
       agentId: AGENT_ID,
+      connectionType: 'webrtc',
       onConnect: (info) => {
         const cid = (info && (info.conversationId || info.conversation_id)) || '';
         setCallUI(true);
@@ -1935,6 +1948,12 @@ async function toggleCall() {
         const src  = (m && (m.source || m.role)) || '';
         if (!text) return;
         const role = (src === 'ai' || src === 'agent') ? 'agent' : 'user';
+        // Filter phantom echo from caller side (STT hears the speaker)
+        const PHANTOMS = ['okay','ok','uh-huh','uh huh','um','uh','hmm','mm','mhm','mm-hmm','yeah','yep','right','sure','bye','hello','hi','hey','thanks','thank you'];
+        if (role === 'user' && PHANTOMS.includes(text.toLowerCase().replace(/[.!?,]/g,''))) {
+          console.log('[voice] Filtered phantom:', text);
+          return;
+        }
         liveTurns.push({ role: role, message: text });
         if (window.renderPanel3) window.renderPanel3(liveTurns);
         fetch('/demo/transcript', {
