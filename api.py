@@ -1608,7 +1608,7 @@ async def _generate_practice_coach(turns: list) -> dict:
         "to their SMB clients. Your job is to coach Steve in REAL TIME. Be blunt. Be specific.\n\n"
         "Return ONLY this JSON, no prose:\n"
         '{"health":"green|yellow|red","close_pct":<integer 0-100>,'
-        '"tone":"<3-7 word read of the customer's mood right now>",'
+        '"tone":"<3-7 word read of how the customer feels right now>",'
         '"tips":["<tip>","<tip>","<tip>"]}\n\n'
         "TIPS RULES:\n"
         "- 2-4 tips. Terse fragments, MAX 8 WORDS each.\n"
