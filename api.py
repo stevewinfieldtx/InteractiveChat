@@ -19,6 +19,20 @@ from company_research import (
 )
 from cpp_voice import CPP_VOICE, CPP_STYLE_LIGHT
 
+
+
+# ─── CPP post-processor: kill em dashes from all LLM output ──────────────────
+def _clean_voice(text: str) -> str:
+    """Strip em dashes from LLM output. Steve never uses them. Zero in 646K words."""
+    if not text:
+        return text
+    # Replace em dash (U+2014) and en dash (U+2013) with ellipsis or space
+    text = text.replace("\u2014", "...")   # em dash -> ellipsis
+    text = text.replace("\u2013", "...")   # en dash -> ellipsis
+    text = text.replace(" ... ", "... ")    # clean up double spaces around ellipsis
+    return text
+
+
 app = FastAPI(title="Guardz Research Agent", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
@@ -541,7 +555,7 @@ QUESTIONS FOR {SALES_REP_NAME.upper()}
                 }
             )
             if resp.status_code == 200:
-                return resp.json()["choices"][0]["message"]["content"].strip()
+                return _clean_voice(resp.json()["choices"][0]["message"]["content"].strip())
             else:
                 print(f"[brief] OpenRouter {resp.status_code}: {resp.text[:200]}")
     except Exception as e:
@@ -1053,7 +1067,7 @@ TRANSCRIPT:
                       "max_tokens": 600, "temperature": 0.3},
             )
         if resp.status_code == 200:
-            return resp.json()["choices"][0]["message"]["content"].strip()
+            return _clean_voice(resp.json()["choices"][0]["message"]["content"].strip())
         print(f"[summary] OpenRouter {resp.status_code}: {resp.text[:160]}")
     except Exception as e:
         print(f"[summary] error: {e}")
@@ -1130,7 +1144,12 @@ async def _generate_copilot(messages: list) -> dict:
             txt = resp.json()["choices"][0]["message"]["content"]
             i, j = txt.find("{"), txt.rfind("}")
             if i != -1 and j != -1:
-                return _j.loads(txt[i:j + 1])
+                result = _j.loads(txt[i:j + 1])
+                if "tips" in result:
+                    result["tips"] = [_clean_voice(t) for t in result.get("tips", [])]
+                if "tone" in result:
+                    result["tone"] = _clean_voice(result["tone"])
+                return result
         else:
             print(f"[copilot] OpenRouter {resp.status_code}: {resp.text[:160]}")
     except Exception as e:
@@ -1248,7 +1267,7 @@ async def _generate_rep_reply(messages: list) -> str:
                       "max_tokens": 180, "temperature": 0.6},
             )
         if resp.status_code == 200:
-            return resp.json()["choices"][0]["message"]["content"].strip().strip('"')
+            return _clean_voice(resp.json()["choices"][0]["message"]["content"].strip().strip('"'))
         print(f"[rep-suggest] OpenRouter {resp.status_code}: {resp.text[:160]}")
     except Exception as e:
         print(f"[rep-suggest] error: {e}")
@@ -1416,7 +1435,7 @@ async def _generate_guardz_reply(messages: list) -> str:
                       "max_tokens": 220, "temperature": 0.5},
             )
         if resp.status_code == 200:
-            return resp.json()["choices"][0]["message"]["content"].strip().strip('"')
+            return _clean_voice(resp.json()["choices"][0]["message"]["content"].strip().strip('"'))
         print(f"[guardz-chat] OpenRouter {resp.status_code}: {resp.text[:160]}")
     except Exception as e:
         print(f"[guardz-chat] error: {e}")
