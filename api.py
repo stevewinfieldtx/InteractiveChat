@@ -451,6 +451,48 @@ SIGNAL_LABELS = {
     "other":            "⚡ Close signal detected",
 }
 
+
+
+async def _slack_availability_ping(contact: dict, customer: dict, signal_label: str, last_msg: str):
+    """Ping Slack: hot lead, who can call them back? First responder claims it."""
+    if not SLACK_WEBHOOK_URL:
+        print(f"[slack] No SLACK_WEBHOOK_URL set. Would ping for {contact.get('name', 'Unknown')}")
+        return
+    import httpx
+
+    name = contact.get("name") or "Unknown"
+    company = contact.get("company") or "Unknown"
+    phone = contact.get("phone") or "(collecting...)"
+    email = contact.get("email") or "(collecting...)"
+    vertical = customer.get("name") or customer.get("industry") or ""
+
+    blocks = [
+        {"type": "header", "text": {"type": "plain_text", "text": "\U0001f525 Lead ready for callback", "emoji": True}},
+        {"type": "section", "fields": [
+            {"type": "mrkdwn", "text": f"*Partner:*\n{name} at {company}"},
+            {"type": "mrkdwn", "text": f"*Their customers:*\n{vertical or '(ask them)'}"},
+        ]},
+        {"type": "section", "fields": [
+            {"type": "mrkdwn", "text": f"*Phone:*\n{phone}"},
+            {"type": "mrkdwn", "text": f"*Email:*\n{email}"},
+        ]},
+        {"type": "section", "text": {"type": "mrkdwn",
+            "text": f"*Signal:* {signal_label}\n*Last thing they said:*\n> {last_msg or '(on the call now)'}"}},
+        {"type": "divider"},
+        {"type": "section", "text": {"type": "mrkdwn",
+            "text": "*Who can call them back in the next 5 minutes?*\nReact with :raised_hand: or reply here to claim it."}},
+    ]
+
+    fallback = f"\U0001f525 {name} @ {company} ready for callback. Phone: {phone}. Who can take it?"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(SLACK_WEBHOOK_URL, json={"text": fallback, "blocks": blocks})
+            resp.raise_for_status()
+            print(f"[slack] Availability ping sent for {name} @ {company}")
+    except Exception as e:
+        print(f"[slack] Availability ping error: {e}")
+
+
 class NotifyHumanRequest(BaseModel):
     session_id: str = ""
     prospect_name: str = ""
@@ -889,6 +931,10 @@ async def _process_notification(req: NotifyHumanRequest, label: str):
                 ok, detail = await send_email(SALES_TEAM_EMAIL, subj, html)
                 st["availability_sent"] = True
                 print(f"[handoff] availability email -> {SALES_TEAM_EMAIL}: ok={ok} ({detail})")
+                # Slack availability ping: "who can call them back?"
+                await _slack_availability_ping(contact, customer, label, req.message)
+                # Slack availability ping: "who can call them back?"
+                await _slack_availability_ping(contact, customer, label, req.message)
 
             # Send the full brief once we have a callback number (the callback step),
             # or immediately on an explicit handoff_requested signal.
