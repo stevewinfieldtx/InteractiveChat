@@ -1024,6 +1024,10 @@ async def add_transcript(turn: TranscriptTurn):
     if role == "user" and msg.lower().rstrip(".!?,") in _PHANTOM_WORDS:
         print(f"[transcript] Filtered phantom: '{msg}'")
         return {"ok": True, "turns": len(_live_transcript), "filtered": True}
+    # Block agent self-loop: skip if last stored turn was also agent
+    if role == "agent" and _live_transcript and _live_transcript[-1].get("role") == "agent":
+        print(f"[transcript] Blocked consecutive agent message: {msg[:60]}")
+        return {"ok": True, "turns": len(_live_transcript), "blocked": "consecutive_agent"}
     _live_transcript.append({"role": role, "message": msg})
     if len(_live_transcript) > 200:
         _live_transcript = _live_transcript[-200:]
@@ -1952,6 +1956,11 @@ async function toggleCall() {
         const PHANTOMS = ['okay','ok','uh-huh','uh huh','um','uh','hmm','mm','mhm','mm-hmm','yeah','yep','right','sure','bye','hello','hi','hey','thanks','thank you'];
         if (role === 'user' && PHANTOMS.includes(text.toLowerCase().replace(/[.!?,]/g,''))) {
           console.log('[voice] Filtered phantom:', text);
+          return;
+        }
+        // Block agent talking to itself: skip if last turn was also agent
+        if (role === 'agent' && liveTurns.length > 0 && liveTurns[liveTurns.length - 1].role === 'agent') {
+          console.log('[voice] Blocked consecutive agent message:', text.slice(0, 60));
           return;
         }
         liveTurns.push({ role: role, message: text });
