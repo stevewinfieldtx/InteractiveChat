@@ -1174,7 +1174,7 @@ async def _generate_copilot(messages: list) -> dict:
         "make the REP better — NOT to talk for them.\n\n"
         "Return ONLY this JSON, no prose:\n"
         '{"health":"green|yellow|red","intent":<integer 0-100>,'
-        '"tone":"<3-7 word read of the customer\'s mood/intent>",'
+        '"tone":"<3-7 word read of the how the customer feels/intent>",'
         '"tips":["<tip>","<tip>"]}\n\n'
         "TIPS RULES:\n"
         "- 1-3 tips, each a TERSE fragment, MAX 6 WORDS. No sentences, no reasoning. "
