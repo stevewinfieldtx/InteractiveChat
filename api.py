@@ -1250,7 +1250,7 @@ async def _generate_copilot(messages: list) -> dict:
     prompt = (
         f"{CPP_STYLE_LIGHT}\n\n"
         "You are a live sales coach sitting beside a Rain Networks rep who is chatting with an IT "
-        "reseller (the CUSTOMER) about selling Guardz to the reseller's own clients. Your job is to "
+        "reseller (the CUSTOMER) about Rain Networks' cybersecurity products for the reseller's own clients. Your job is to "
         "make the REP better — NOT to talk for them.\n\n"
         "Return ONLY this JSON, no prose:\n"
         '{"health":"green|yellow|red","intent":<integer 0-100>,'
@@ -1474,7 +1474,7 @@ async def _ping_team_zoom(sid: str, first_msg: str, wait: int):
     body = (f"A visitor wants to talk.\n> {first_msg[:200]}\n"
             f"Claim it (first to reply takes it): {link}\n"
             f"AI takes over in ~{wait}s if no one grabs it.")
-    await _post_zoom("🟢 New Guardz chat", body, tag="team-ping")
+    await _post_zoom("🟢 New Rain Networks chat", body, tag="team-ping")
 
 
 async def _ai_fallback_after(sid: str, wait: int):
@@ -1487,9 +1487,9 @@ async def _ai_fallback_after(sid: str, wait: int):
         chat["ai_active"] = True
         reply = await _generate_guardz_reply(chat["messages"], collect_contact=True)
         intro = ("Thanks for your patience! Our specialists are all tied up right now, so I'll jump in "
-                 "directly — I'm the Guardz AI assistant. ")
+                 "directly. I'm the Rain Networks assistant. ")
         chat["messages"].append({"role": "agent",
-                                 "text": intro + (reply or "What can I tell you about Guardz?"),
+                                 "text": intro + (reply or "What can I help you with at Rain Networks?"),
                                  "ts": datetime.utcnow().isoformat()})
         await _guardz_capture(sid)
         await _post_after_hours_lead(sid)
@@ -1653,22 +1653,29 @@ async def _generate_guardz_reply(messages: list, collect_contact: bool = False) 
         )
     prompt = (
         f"{CPP_VOICE}\n\n"
-        "You are a friendly, sharp Guardz expert at Rain Networks, chatting with a visitor on the "
-        "Guardz product page. The visitor is usually an IT reseller / MSP weighing whether to offer "
-        "Guardz to their SMB clients. Answer clearly and concisely — 1-3 short, conversational "
-        "sentences, never an info-dump. Be helpful first. Naturally learn what they sell and who their "
-        "clients are so you can make it relevant. When the moment feels right, offer to have a "
-        "specialist follow up and ask for their email — don't force it early.\n\n"
-        "GUARDZ FACTS: all-in-one cybersecurity + cyber insurance platform for MSPs/resellers serving "
-        "SMBs — email security, EDR (SentinelOne), identity threat detection, cloud security "
-        "(M365/Google), security awareness training, phishing simulation, and external footprint "
-        "scanning, in one multi-tenant console. Free Community tier; Pro and Ultimate per-user/mo "
-        "(Ultimate includes SentinelOne MDR); no enterprise commitment. 2025 MSP Today Product of the "
-        "Year; $56M Series B. Partners typically add it at $5-15/user on existing contracts.\n\n"
+        "You are the website assistant for Rain Networks, a security-focused value-added distributor "
+        "(since 2003) that helps IT resellers and MSPs find, price, and deploy cybersecurity products "
+        "for their own SMB clients. You represent Rain Networks, not any single vendor. Answer clearly "
+        "and concisely — 1-3 short, conversational sentences, never an info-dump. Be helpful first, and "
+        "naturally learn what they sell and who their clients are so you can point them to the right fit.\n\n"
+        "WHAT RAIN CARRIES — five categories across 15 vetted vendors:\n"
+        "- Endpoint Security: ESET, Bitdefender, Heimdal, Guardz, VIPRE, Avast Business\n"
+        "- Email Security: Proofpoint, Barracuda, Trustifi, Sendmarc\n"
+        "- Backup & Recovery: Macrium, Redstor\n"
+        "- Security Awareness: NINJIO\n"
+        "- RMM & IT Management: Atera, Pulseway\n"
+        "If the visitor asks about a specific vendor (for example Guardz or ESET), answer about THAT "
+        "vendor helpfully and tie it to their clients' needs. If they aren't sure what they need, ask a "
+        "question or two and recommend a fit. When the moment feels right, offer to have a specialist "
+        "follow up and ask for their email — don't force it early.\n\n"
+        "RULES: Never invent or quote a specific price — Rain provides tailored partner pricing based on "
+        "requirements and volume, so offer to have a specialist put pricing together. The only contact "
+        "email is contact@rainnetworks.com and the phone is (425) 893-9800; never use any other. If you "
+        "don't know something, don't guess — offer to have a specialist follow up within one business day.\n\n"
         f"{collect_block}"
-        "If asked, you're the Guardz AI assistant for Rain Networks (don't claim to be human). "
+        "If asked, you're the Rain Networks AI assistant (don't claim to be human). "
         "Output ONLY your next reply.\n\n"
-        f"CONVERSATION:\n{convo if convo else '(the visitor just opened the chat — greet them warmly and ask what brought them in)'}"
+        f"CONVERSATION:\n{convo if convo else '(the visitor just opened the chat — greet them warmly as Rain Networks and ask what brought them in)'}"
     )
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
@@ -1706,12 +1713,12 @@ async def _guardz_capture(sid: str):
                      brief="", transcript=msgs)
     import html as _h
     lines = "".join(
-        f"<div style='margin:4px 0'><b>{'Visitor' if m.get('role')=='customer' else 'Guardz AI'}:</b> "
+        f"<div style='margin:4px 0'><b>{'Visitor' if m.get('role')=='customer' else 'Rain Networks AI'}:</b> "
         f"{_h.escape(m.get('text',''))}</div>" for m in msgs[-14:]
     )
     body = (f"<div style=\"font-family:-apple-system,Segoe UI,sans-serif;color:#1f2937\">"
-            f"<h3>New Guardz-page chat lead</h3><p><b>Email:</b> {_h.escape(email)}</p><hr>{lines}</div>")
-    ok, detail = await send_email(SALES_TEAM_EMAIL, f"🌐 Guardz page lead — {email}", body)
+            f"<h3>New Rain Networks chat lead</h3><p><b>Email:</b> {_h.escape(email)}</p><hr>{lines}</div>")
+    ok, detail = await send_email(SALES_TEAM_EMAIL, f"🌐 Rain Networks chat lead: {email}", body)
     print(f"[guardz-chat] lead {email} -> {SALES_TEAM_EMAIL}: ok={ok} ({detail})")
 
 
@@ -2247,7 +2254,7 @@ async def agent_console():
 # without deploying the site. Open /visitor (be the customer) + /agent (be the rep), same session.
 VISITOR_PAGE = """<!DOCTYPE html><html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Guardz — Chat with a specialist</title>
+<title>Rain Networks Chat</title>
 <style>
  *{box-sizing:border-box;margin:0;padding:0}
  html,body{height:100%;background:#080818;color:#fff;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
@@ -2265,7 +2272,7 @@ VISITOR_PAGE = """<!DOCTYPE html><html lang="en"><head>
  .inrow button{background:linear-gradient(135deg,#7c3aed,#4f46e5);border:none;border-radius:10px;color:#fff;font-weight:700;padding:11px 18px;cursor:pointer}
 </style></head><body>
 <div class="wrap">
- <div class="hd"><span class="dot"></span><div><b>Chat with a Guardz specialist</b><small id="status">Ask anything — a real person replies here.</small></div></div>
+ <div class="hd"><span class="dot"></span><div><b>Chat with a Rain Networks specialist</b><small id="status">Ask anything, a real person replies here.</small></div></div>
  <div class="msgs" id="m"></div>
  <div class="inrow"><input id="i" placeholder="Type your question..." onkeydown="if(event.key==='Enter')send()"><button onclick="send()">Send</button></div>
 </div>
@@ -2273,7 +2280,7 @@ VISITOR_PAGE = """<!DOCTYPE html><html lang="en"><head>
 const P=new URLSearchParams(location.search);
 const SID=P.get('session')||'guardz-live';
 const WAIT=parseInt(P.get('wait')||'0',10)||0;
-const STAT={idle:'Ask anything — a real person replies here.',waiting:'\\u23F3 Connecting you with a specialist…',human:'\\u2713 Specialist connected',ai:'\\uD83E\\uDD16 Guardz AI assistant — happy to help'};
+const STAT={idle:'Ask anything, a real person replies here.',waiting:'\\u23F3 Connecting you with a specialist…',human:'\\u2713 Specialist connected',ai:'\\uD83E\\uDD16 Rain Networks assistant, happy to help'};
 function esc(s){return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function render(msgs){const m=document.getElementById('m');m.innerHTML=(msgs||[]).map(x=>'<div class="b '+(x.role==='customer'?'me':'them')+'">'+esc(x.text)+'</div>').join('');m.scrollTop=m.scrollHeight;}
 async function send(){const i=document.getElementById('i');const t=(i.value||'').trim();if(!t)return;i.value='';await fetch('/chat/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:SID,role:'customer',message:t,wait:WAIT})});poll();}
