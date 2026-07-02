@@ -6,11 +6,12 @@ import asyncio
 import os
 import re
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import asyncpg
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 
 from company_research import (
@@ -59,8 +60,29 @@ SMTP_PASS        = os.getenv("SMTP_PASS", "")
 # Send the lightweight "are you available?" ping on the first buying signal.
 SEND_AVAILABILITY_PING = os.getenv("HANDOFF_SEND_AVAILABILITY", "true").lower() == "true"
 # Live chat handoff: ping the team, then let the AI take over if no human answers in time.
-GUARDZ_HUMAN_WAIT_SECONDS = int(os.getenv("GUARDZ_HUMAN_WAIT_SECONDS", "60"))
+GUARDZ_HUMAN_WAIT_SECONDS = int(os.getenv("GUARDZ_HUMAN_WAIT_SECONDS", "30"))
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://interactivechat.up.railway.app")
+
+# ─── Business hours: humans answer inside the window, AI answers outside it ────
+# Inside hours a chat pings the team (with AI as a safety net if no one claims it);
+# outside hours the AI answers immediately. Coaching runs at all times either way.
+BUSINESS_TZ         = os.getenv("BUSINESS_TZ", "America/Los_Angeles")
+BUSINESS_HOUR_START = int(os.getenv("BUSINESS_HOUR_START", "9"))   # 9 = 9:00am
+BUSINESS_HOUR_END   = int(os.getenv("BUSINESS_HOUR_END", "17"))    # 17 = 5:00pm (5pm itself is AI)
+# Days a human covers, as Python weekday() ints (Mon=0 .. Sun=6). Default Mon-Fri.
+BUSINESS_DAYS = {int(d) for d in os.getenv("BUSINESS_DAYS", "0,1,2,3,4").split(",") if d.strip() != ""}
+
+
+def _within_business_hours() -> bool:
+    """True when 'now' in BUSINESS_TZ is on a business day AND in [START, END).
+    Evenings and weekends fall through to the AI. On any timezone error, default to
+    business hours so a human still gets pinged."""
+    try:
+        now = datetime.now(ZoneInfo(BUSINESS_TZ))
+    except Exception as e:
+        print(f"[hours] tz error ({BUSINESS_TZ}): {e}; defaulting to business hours")
+        return True
+    return now.weekday() in BUSINESS_DAYS and BUSINESS_HOUR_START <= now.hour < BUSINESS_HOUR_END
 
 # ─── Demo state (in-memory, resets on redeploy) ───────────────────────────────
 
@@ -439,9 +461,103 @@ async def health():
     return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
 
 
-# ─── Slack / Human alert ──────────────────────────────────────────────────────
+# ─── Drop-in embeddable chat widget ───────────────────────────────────────────
+# One line on any website:
+#   <script src="https://interactivechat.up.railway.app/widget.js"
+#           data-title="Rain Networks" data-accent="#2563eb" defer></script>
+# Renders a floating launcher + chat panel in a shadow root (host CSS can't leak in),
+# gives each visitor a unique session, and talks to /chat/send + /chat/state. During
+# business hours it pings the team and the human answers (co-pilot assists in /agent);
+# after 45s or after hours the AI covers.
+WIDGET_JS = r'''
+(function(){
+  var me=document.currentScript||(function(){var s=document.querySelectorAll('script[src*="widget.js"]');return s[s.length-1];})();
+  if(!me)return;
+  var BASE=new URL(me.src).origin;
+  var TITLE=me.getAttribute('data-title')||'Chat';
+  var ACCENT=me.getAttribute('data-accent')||'#2563eb';
+  var GREETING=me.getAttribute('data-greeting')||'Hi! How can we help? Ask us anything and a specialist will jump in, or our assistant can help right away.';
+  var LAUNCH=me.getAttribute('data-launch')||'Chat now';
+  var WAIT=parseInt(me.getAttribute('data-wait')||'45',10);
+  var SKEY='ic_sid';
+  var sid=localStorage.getItem(SKEY);
+  if(!sid){sid='s_'+Math.random().toString(36).slice(2)+Date.now().toString(36);localStorage.setItem(SKEY,sid);}
+  var rendered=0,polling=null;
+  var host=document.createElement('div');
+  host.style.cssText='position:fixed;bottom:20px;right:20px;z-index:2147483000';
+  document.body.appendChild(host);
+  var root=host.attachShadow({mode:'open'});
+  var CSS='*{box-sizing:border-box;font-family:system-ui,Segoe UI,Roboto,sans-serif}'
+    +'.launch{display:flex;align-items:center;gap:8px;background:'+ACCENT+';color:#fff;border:0;border-radius:999px;padding:13px 20px;font-size:15px;font-weight:600;cursor:pointer;box-shadow:0 8px 24px rgba(0,0,0,.25)}'
+    +'.launch svg{width:18px;height:18px;fill:#fff}'
+    +'.panel{display:none;flex-direction:column;width:360px;max-width:calc(100vw - 32px);height:520px;max-height:calc(100vh - 110px);background:#fff;border-radius:16px;overflow:hidden;box-shadow:0 24px 60px rgba(0,0,0,.32);border:1px solid #e6e9ef}'
+    +'.panel.show{display:flex}'
+    +'.hd{background:'+ACCENT+';color:#fff;padding:15px 16px;display:flex;align-items:center;justify-content:space-between}'
+    +'.hd b{font-size:15px}.hd .st{font-size:12px;opacity:.9;margin-top:2px}'
+    +'.x{background:transparent;border:0;color:#fff;font-size:20px;cursor:pointer;line-height:1}'
+    +'.body{flex:1;overflow-y:auto;padding:16px;background:#f7f9fc;display:flex;flex-direction:column;gap:10px}'
+    +'.m{max-width:80%;padding:10px 13px;border-radius:14px;font-size:14px;line-height:1.45;white-space:pre-wrap;word-wrap:break-word}'
+    +'.m.you{align-self:flex-end;background:'+ACCENT+';color:#fff;border-bottom-right-radius:4px}'
+    +'.m.them{align-self:flex-start;background:#fff;color:#16202b;border:1px solid #e6e9ef;border-bottom-left-radius:4px}'
+    +'.who{font-size:11px;color:#6b7c92;margin:0 4px -2px}'
+    +'.foot{display:flex;gap:8px;padding:12px;border-top:1px solid #eef1f5;background:#fff}'
+    +'.foot input{flex:1;border:1px solid #d7dde6;border-radius:10px;padding:11px 12px;font-size:14px;outline:none}'
+    +'.foot input:focus{border-color:'+ACCENT+'}'
+    +'.foot button{background:'+ACCENT+';color:#fff;border:0;border-radius:10px;padding:0 16px;font-weight:600;cursor:pointer}';
+  root.innerHTML='<style>'+CSS+'</style>'
+    +'<button class="launch" id="launch"><svg viewBox="0 0 24 24"><path d="M4 4h16a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H8l-4 4V6a2 2 0 0 1 2-2z"/></svg><span id="lt"></span></button>'
+    +'<div class="panel" id="panel"><div class="hd"><div><b id="ht"></b><div class="st" id="st">Online</div></div><button class="x" id="x">&#215;</button></div>'
+    +'<div class="body" id="body"></div>'
+    +'<div class="foot"><input id="in" placeholder="Type a message..." autocomplete="off"/><button id="send">Send</button></div></div>';
+  var $=function(id){return root.getElementById(id);};
+  $('lt').textContent=LAUNCH; $('ht').textContent=TITLE;
+  function statusText(m){if(m==='waiting')return 'Connecting you to a specialist...';if(m==='human')return 'Specialist';if(m==='ai')return 'Assistant';return 'Online';}
+  function addMsg(role,text){var mine=(role==='customer');var wrap=document.createElement('div');if(!mine){var w=document.createElement('div');w.className='who';w.textContent=(role==='rep'||role==='human')?'Specialist':'Assistant';wrap.appendChild(w);}var m=document.createElement('div');m.className='m '+(mine?'you':'them');m.textContent=text;wrap.appendChild(m);$('body').appendChild(wrap);$('body').scrollTop=$('body').scrollHeight;}
+  function apply(msgs,mode){msgs.forEach(function(m){addMsg(m.role,m.text);});rendered+=msgs.length;$('st').textContent=statusText(mode);}
+  function poll(){fetch(BASE+'/chat/state?session_id='+encodeURIComponent(sid)).then(function(r){return r.json();}).then(function(d){var all=d.messages||[];if(all.length>rendered)apply(all.slice(rendered),d.mode);else if(d.mode)$('st').textContent=statusText(d.mode);}).catch(function(){});}
+  function startPoll(){if(!polling)polling=setInterval(poll,2500);}
+  function send(){var v=$('in').value.trim();if(!v)return;$('in').value='';addMsg('customer',v);rendered+=1;fetch(BASE+'/chat/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sid,message:v,role:'customer',wait:WAIT})}).then(function(){setTimeout(poll,600);}).catch(function(){});}
+  function openPanel(){$('launch').style.display='none';$('panel').classList.add('show');if(rendered===0&&GREETING)addMsg('agent',GREETING);startPoll();poll();$('in').focus();}
+  function closePanel(){$('panel').classList.remove('show');$('launch').style.display='flex';}
+  $('launch').onclick=openPanel;$('x').onclick=closePanel;$('send').onclick=send;
+  $('in').addEventListener('keydown',function(e){if(e.key==='Enter')send();});
+})();
+'''
 
-SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
+
+@app.get("/widget.js")
+async def widget_js():
+    return Response(content=WIDGET_JS, media_type="application/javascript")
+
+
+# ─── Zoom Team Chat / Human alert ─────────────────────────────────────────────
+
+ZOOM_WEBHOOK_URL = os.getenv("ZOOM_WEBHOOK_URL", "")
+ZOOM_WEBHOOK_TOKEN = os.getenv("ZOOM_WEBHOOK_TOKEN", "")
+
+
+async def _post_zoom(head: str, body: str, sub_head: str = "", tag: str = "zoom"):
+    """Send a message to Zoom Team Chat via the Incoming Webhook Chatbot.
+    Posts the rich `?format=full` payload (head + message body); the verification
+    token goes in the Authorization header. No-op (logs only) when ZOOM_WEBHOOK_URL
+    is unset, so local dev still works without a webhook configured."""
+    if not ZOOM_WEBHOOK_URL:
+        print(f"[{tag}] No ZOOM_WEBHOOK_URL set. Would post: {head} | {body[:120]}")
+        return
+    import httpx
+    url = ZOOM_WEBHOOK_URL + ("&" if "?" in ZOOM_WEBHOOK_URL else "?") + "format=full"
+    head_obj = {"text": head}
+    if sub_head:
+        head_obj["sub_head"] = {"text": sub_head}
+    payload = {"content": {"head": head_obj, "body": [{"type": "message", "text": body}]}}
+    headers = {"Authorization": ZOOM_WEBHOOK_TOKEN, "Content-Type": "application/json"}
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+            resp.raise_for_status()
+            print(f"[{tag}] sent: {head}")
+    except Exception as e:
+        print(f"[{tag}] error: {e}")
 SIGNAL_LABELS = {
     "pricing_question": "💰 Asked about pricing / contract terms",
     "demo_agreed":      "✅ Agreed to a demo",
@@ -454,44 +570,24 @@ SIGNAL_LABELS = {
 
 
 
-async def _slack_availability_ping(contact: dict, customer: dict, signal_label: str, last_msg: str):
-    """Ping Slack: hot lead, who can call them back? First responder claims it."""
-    if not SLACK_WEBHOOK_URL:
-        print(f"[slack] No SLACK_WEBHOOK_URL set. Would ping for {contact.get('name', 'Unknown')}")
-        return
-    import httpx
-
+async def _zoom_availability_ping(contact: dict, customer: dict, signal_label: str, last_msg: str):
+    """Ping Zoom: hot lead, who can call them back? First responder claims it."""
     name = contact.get("name") or "Unknown"
     company = contact.get("company") or "Unknown"
     phone = contact.get("phone") or "(collecting...)"
     email = contact.get("email") or "(collecting...)"
     vertical = customer.get("name") or customer.get("industry") or ""
 
-    blocks = [
-        {"type": "header", "text": {"type": "plain_text", "text": "\U0001f525 Lead ready for callback", "emoji": True}},
-        {"type": "section", "fields": [
-            {"type": "mrkdwn", "text": f"*Partner:*\n{name} at {company}"},
-            {"type": "mrkdwn", "text": f"*Their customers:*\n{vertical or '(ask them)'}"},
-        ]},
-        {"type": "section", "fields": [
-            {"type": "mrkdwn", "text": f"*Phone:*\n{phone}"},
-            {"type": "mrkdwn", "text": f"*Email:*\n{email}"},
-        ]},
-        {"type": "section", "text": {"type": "mrkdwn",
-            "text": f"*Signal:* {signal_label}\n*Last thing they said:*\n> {last_msg or '(on the call now)'}"}},
-        {"type": "divider"},
-        {"type": "section", "text": {"type": "mrkdwn",
-            "text": "*Who can call them back in the next 5 minutes?*\nReact with :raised_hand: or reply here to claim it."}},
-    ]
-
-    fallback = f"\U0001f525 {name} @ {company} ready for callback. Phone: {phone}. Who can take it?"
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(SLACK_WEBHOOK_URL, json={"text": fallback, "blocks": blocks})
-            resp.raise_for_status()
-            print(f"[slack] Availability ping sent for {name} @ {company}")
-    except Exception as e:
-        print(f"[slack] Availability ping error: {e}")
+    body = (
+        f"Partner: {name} at {company}\n"
+        f"Their customers: {vertical or '(ask them)'}\n"
+        f"Phone: {phone}\n"
+        f"Email: {email}\n"
+        f"Signal: {signal_label}\n"
+        f"Last thing they said:\n> {last_msg or '(on the call now)'}\n\n"
+        "Who can call them back in the next 5 minutes? Reply here to claim it."
+    )
+    await _post_zoom("\U0001f525 Lead ready for callback", body, tag="zoom-availability")
 
 
 class NotifyHumanRequest(BaseModel):
@@ -828,7 +924,7 @@ def _build_handoff_email(contact: dict, customer: dict, last_message: str,
     return subject, _email_shell(inner)
 
 
-# ─── Notify human (background-driven email + optional Slack) ───────────────────
+# ─── Notify human (background-driven email + optional Zoom) ────────────────────
 
 HANDOFF_SIGNALS = ("handoff_requested", "strong_interest", "demo_agreed",
                    "named_client", "pricing_question", "how_to_start")
@@ -886,7 +982,7 @@ async def notify_human(req: NotifyHumanRequest):
     if len(_demo_signals) > 20:
         _demo_signals.pop()
 
-    # Heavy work (brief generation + email + Slack) runs in the background so the
+    # Heavy work (brief generation + email + Zoom) runs in the background so the
     # voice agent's tool call returns instantly and the web conversation never stalls.
     asyncio.create_task(_process_notification(req, label))
 
@@ -894,7 +990,7 @@ async def notify_human(req: NotifyHumanRequest):
 
 
 async def _process_notification(req: NotifyHumanRequest, label: str):
-    """Background worker: email handoff (availability ping + full brief) and optional Slack."""
+    """Background worker: email handoff (availability ping + full brief) and optional Zoom."""
     try:
         is_handoff = req.signal_type in HANDOFF_SIGNALS
         transcript = list(_live_transcript)
@@ -932,10 +1028,8 @@ async def _process_notification(req: NotifyHumanRequest, label: str):
                 ok, detail = await send_email(SALES_TEAM_EMAIL, subj, html)
                 st["availability_sent"] = True
                 print(f"[handoff] availability email -> {SALES_TEAM_EMAIL}: ok={ok} ({detail})")
-                # Slack availability ping: "who can call them back?"
-                await _slack_availability_ping(contact, customer, label, req.message)
-                # Slack availability ping: "who can call them back?"
-                await _slack_availability_ping(contact, customer, label, req.message)
+                # Zoom availability ping: "who can call them back?"
+                await _zoom_availability_ping(contact, customer, label, req.message)
 
             # Send the full brief once we have a callback number (the callback step),
             # or immediately on an explicit handoff_requested signal.
@@ -953,9 +1047,9 @@ async def _process_notification(req: NotifyHumanRequest, label: str):
                 st["brief_sent"] = True
                 print(f"[handoff] brief email -> {SALES_TEAM_EMAIL}: ok={ok} ({detail})")
 
-        # ── Slack (optional, off unless SLACK_WEBHOOK_URL is set) ───────────────
-        if SLACK_WEBHOOK_URL:
-            await _post_slack(req, label, is_handoff, customer_co, sales_context, transcript)
+        # ── Zoom (optional, off unless ZOOM_WEBHOOK_URL is set) ─────────────────
+        if ZOOM_WEBHOOK_URL:
+            await _post_zoom_brief(req, label, is_handoff, customer_co, sales_context, transcript)
 
         # ── Persist the lead for follow-up + engagement BI (every notify_human) ──
         await _save_lead(
@@ -972,8 +1066,8 @@ async def _process_notification(req: NotifyHumanRequest, label: str):
         print(f"[notify] worker error: {e}")
 
 
-async def _post_slack(req: NotifyHumanRequest, label: str, is_handoff: bool,
-                      customer_co: dict, sales_context: dict, transcript: list):
+async def _post_zoom_brief(req: NotifyHumanRequest, label: str, is_handoff: bool,
+                           customer_co: dict, sales_context: dict, transcript: list):
     brief_text = ""
     if is_handoff:
         brief_text = await _generate_sales_brief(
@@ -984,46 +1078,32 @@ async def _post_slack(req: NotifyHumanRequest, label: str, is_handoff: bool,
                  if req.session_id else "")
 
     if is_handoff:
-        blocks = [
-            {"type":"header","text":{"type":"plain_text","text":f"🔥 HANDOFF — {SALES_REP_NAME}, you're up","emoji":True}},
-            {"type":"section","fields":[
-                {"type":"mrkdwn","text":f"*Prospect:*\n{req.prospect_name or '(not collected)'}"},
-                {"type":"mrkdwn","text":f"*Company:*\n{req.company_name or '(unknown)'}"},
-            ]},
-            {"type":"section","text":{"type":"mrkdwn","text":f"*Signal:* {label}\n*Last thing they said:*\n> {req.message or ''}"}},
+        head = f"🔥 HANDOFF — {SALES_REP_NAME}, you're up"
+        lines = [
+            f"Prospect: {req.prospect_name or '(not collected)'}",
+            f"Company: {req.company_name or '(unknown)'}",
+            f"Signal: {label}",
+            f"Last thing they said:\n> {req.message or ''}",
         ]
         if brief_text:
-            blocks.append({"type":"divider"})
-            blocks.append({"type":"section","text":{"type":"mrkdwn","text":f"*📋 SALES BRIEF*\n```{brief_text[:2900]}```"}})
+            lines.append(f"\n📋 SALES BRIEF\n{brief_text[:2900]}")
         if transcript:
             tx_lines = [f"{'🤖' if t.get('role')=='agent' else '👤'} {t.get('message','')[:120]}"
                         for t in transcript[-8:]]
             tx_preview = "\n".join(tx_lines)
-            blocks.append({"type":"divider"})
-            blocks.append({"type":"section","text":{"type":"mrkdwn",
-                "text":f"*📝 TRANSCRIPT (last {min(8,len(transcript))} turns)*\n```{tx_preview[:2900]}```"}})
+            lines.append(f"\n📝 TRANSCRIPT (last {min(8,len(transcript))} turns)\n{tx_preview[:2900]}")
     else:
-        blocks = [
-            {"type":"section","fields":[
-                {"type":"mrkdwn","text":f"*{label}*"},
-                {"type":"mrkdwn","text":f"{req.prospect_name or '?'} @ {req.company_name or '?'}"},
-            ]},
-            {"type":"section","text":{"type":"mrkdwn","text":f"> {req.message or ''}"}},
+        head = label
+        lines = [
+            f"{req.prospect_name or '?'} @ {req.company_name or '?'}",
+            f"> {req.message or ''}",
         ]
 
     if convo_url:
-        blocks.append({"type":"actions","elements":[{
-            "type":"button","style":"primary","url":convo_url,
-            "text":{"type":"plain_text","text":"View Conversation","emoji":True}}]})
+        lines.append(f"\nView Conversation: {convo_url}")
 
-    try:
-        import httpx
-        fallback = f"🔥 {req.prospect_name or 'Unknown'} @ {req.company_name or 'Unknown'} — {label}"
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(SLACK_WEBHOOK_URL, json={"text": fallback, "blocks": blocks})
-            resp.raise_for_status()
-    except Exception as e:
-        print(f"[slack] error: {e}")
+    body = "\n".join(lines)
+    await _post_zoom(head, body, tag="zoom-brief")
 
 
 
@@ -1220,23 +1300,18 @@ async def _generate_copilot(messages: list) -> dict:
     return {}
 
 
-async def _post_copilot_slack(coach: dict, messages: list):
-    if not SLACK_WEBHOOK_URL or not coach:
+async def _post_copilot_zoom(coach: dict, messages: list):
+    if not ZOOM_WEBHOOK_URL or not coach:
         return
     emoji = {"green": "🟢", "yellow": "🟡", "red": "🔴"}.get(coach.get("health", "yellow"), "🟡")
     last_cust = next((m["text"] for m in reversed(messages) if m.get("role") == "customer"), "")
     tips = coach.get("tips") or ([coach["suggestion"]] if coach.get("suggestion") else [])
     tips_txt = "\n".join(f"• {t}" for t in tips if t) or "•  —"
-    text = (f"{emoji} *Call health: {coach.get('health','?')}*  ·  Intent {coach.get('intent','?')}%\n"
-            f"*Read:* {coach.get('tone','')}\n"
-            f"*Customer:* {last_cust[:160]}\n"
-            f"*Coaching:*\n{tips_txt}")
-    try:
-        import httpx
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            await client.post(SLACK_WEBHOOK_URL, json={"text": text})
-    except Exception as e:
-        print(f"[copilot-slack] {e}")
+    head = f"{emoji} Call health: {coach.get('health','?')}  ·  Intent {coach.get('intent','?')}%"
+    body = (f"Read: {coach.get('tone','')}\n"
+            f"Customer: {last_cust[:160]}\n"
+            f"Coaching:\n{tips_txt}")
+    await _post_zoom(head, body, tag="copilot-zoom")
 
 
 async def _run_copilot(session_id: str):
@@ -1246,7 +1321,7 @@ async def _run_copilot(session_id: str):
     coach = await _generate_copilot(chat["messages"])
     if coach:
         chat["coach"] = coach
-        await _post_copilot_slack(coach, chat["messages"])
+        await _post_copilot_zoom(coach, chat["messages"])
 
 
 async def _generate_customer_reply(messages: list) -> str:
@@ -1360,44 +1435,46 @@ async def chat_send(msg: ChatMessage, background_tasks: BackgroundTasks):
         return {"ok": True, "count": len(chat["messages"])}
 
     # role == "customer" — a real visitor.
-    background_tasks.add_task(_run_copilot, sid)            # keep coaching ready for a human
-    if not chat.get("slack_pinged"):                       # first message → ping team + start timer
-        chat["slack_pinged"] = True
+    background_tasks.add_task(_run_copilot, sid)            # coaching runs at all times (human or AI)
+    if not chat.get("team_pinged"):                        # first message → decide who answers
+        chat["team_pinged"] = True
         chat["started_at"] = datetime.utcnow().isoformat()
-        wait = msg.wait if (msg.wait and msg.wait > 0) else GUARDZ_HUMAN_WAIT_SECONDS
-        background_tasks.add_task(_ping_team_slack, sid, text, wait)
-        asyncio.create_task(_ai_fallback_after(sid, wait))
-    if chat.get("ai_active"):                              # AI already took over → it keeps replying
+        if _within_business_hours():
+            # Business hours → route to a human; AI steps in only if no one claims it in time.
+            wait = msg.wait if (msg.wait and msg.wait > 0) else GUARDZ_HUMAN_WAIT_SECONDS
+            background_tasks.add_task(_ping_team_zoom, sid, text, wait)
+            asyncio.create_task(_ai_fallback_after(sid, wait))
+        else:
+            # Outside business hours → AI answers immediately, no team ping.
+            chat["ai_active"] = True
+    if chat.get("ai_active"):                              # AI is handling → it replies
         background_tasks.add_task(_guardz_then_capture, sid)
     return {"ok": True, "count": len(chat["messages"])}
 
 
 async def _guardz_then_capture(sid: str):
-    """AI generates a reply for the live visitor (fallback mode), then captures the lead."""
+    """AI replies for the live visitor (it's covering), captures the lead, and once it has
+    the full name/company/phone/email, posts the lead to the Zoom group chat."""
     chat = _chats.get(sid)
     if not chat:
         return
-    reply = await _generate_guardz_reply(chat["messages"])
+    reply = await _generate_guardz_reply(chat["messages"], collect_contact=True)
     if reply:
         chat["messages"].append({"role": "agent", "text": reply, "ts": datetime.utcnow().isoformat()})
     await _guardz_capture(sid)
+    await _post_after_hours_lead(sid)
 
 
-async def _ping_team_slack(sid: str, first_msg: str, wait: int):
-    """Ping the sales team that a visitor wants to chat, with a one-click claim link."""
+async def _ping_team_zoom(sid: str, first_msg: str, wait: int):
+    """Ping the sales team in Zoom that a visitor wants to chat, with a one-click claim link."""
     link = f"{PUBLIC_BASE_URL}/agent?session={sid}"
-    if not SLACK_WEBHOOK_URL:
-        print(f"[team-ping] (no SLACK_WEBHOOK_URL) new chat {sid}: {first_msg[:80]} | claim: {link}")
+    if not ZOOM_WEBHOOK_URL:
+        print(f"[team-ping] (no ZOOM_WEBHOOK_URL) new chat {sid}: {first_msg[:80]} | claim: {link}")
         return
-    text = (f"🟢 *New Guardz chat* — a visitor wants to talk.\n> {first_msg[:200]}\n"
-            f"*Claim it (first to reply takes it):* {link}\n"
-            f"_AI takes over in ~{wait}s if no one grabs it._")
-    try:
-        import httpx
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            await client.post(SLACK_WEBHOOK_URL, json={"text": text})
-    except Exception as e:
-        print(f"[team-ping] {e}")
+    body = (f"A visitor wants to talk.\n> {first_msg[:200]}\n"
+            f"Claim it (first to reply takes it): {link}\n"
+            f"AI takes over in ~{wait}s if no one grabs it.")
+    await _post_zoom("🟢 New Guardz chat", body, tag="team-ping")
 
 
 async def _ai_fallback_after(sid: str, wait: int):
@@ -1408,13 +1485,14 @@ async def _ai_fallback_after(sid: str, wait: int):
         if not chat or chat.get("human_active") or chat.get("ai_active"):
             return
         chat["ai_active"] = True
-        reply = await _generate_guardz_reply(chat["messages"])
+        reply = await _generate_guardz_reply(chat["messages"], collect_contact=True)
         intro = ("Thanks for your patience! Our specialists are all tied up right now, so I'll jump in "
                  "directly — I'm the Guardz AI assistant. ")
         chat["messages"].append({"role": "agent",
                                  "text": intro + (reply or "What can I tell you about Guardz?"),
                                  "ts": datetime.utcnow().isoformat()})
         await _guardz_capture(sid)
+        await _post_after_hours_lead(sid)
     except Exception as e:
         print(f"[ai-fallback] {e}")
 
@@ -1426,7 +1504,7 @@ async def chat_state(session_id: str = "copilot"):
         mode = "human"
     elif chat.get("ai_active"):
         mode = "ai"
-    elif chat.get("slack_pinged"):
+    elif chat.get("team_pinged"):
         mode = "waiting"
     else:
         mode = "idle"
@@ -1460,8 +1538,10 @@ class GuardzChatRequest(BaseModel):
     message: str = ""
 
 
-async def _generate_guardz_reply(messages: list) -> str:
-    """Friendly Guardz expert answering a website visitor on the Guardz page."""
+async def _generate_guardz_reply(messages: list, collect_contact: bool = False) -> str:
+    """Friendly Guardz expert answering a website visitor on the Guardz page.
+    When collect_contact is True (the AI is covering because no human is available),
+    it also works to capture the visitor's name, company, phone, and email."""
     if not OPENROUTER_API_KEY:
         return "Thanks for stopping by! The assistant is warming up — try again in a moment."
     import httpx
@@ -1469,6 +1549,16 @@ async def _generate_guardz_reply(messages: list) -> str:
         f"{'VISITOR' if m.get('role') == 'customer' else 'YOU'}: {m.get('text','')}"
         for m in messages[-20:]
     )
+    collect_block = ""
+    if collect_contact:
+        collect_block = (
+            "IMPORTANT — the human team is offline right now, so you're the only one here. "
+            "Alongside being helpful, your job is to collect the visitor's full name, company, "
+            "phone number, and email so the team can follow up first thing. Weave these in "
+            "naturally, asking for one missing detail at a time rather than all at once. Once you "
+            "have all four, warmly confirm someone from the team will reach out and recap what you "
+            "have. Never invent details.\n\n"
+        )
     prompt = (
         f"{CPP_VOICE}\n\n"
         "You are a friendly, sharp Guardz expert at Rain Networks, chatting with a visitor on the "
@@ -1483,6 +1573,7 @@ async def _generate_guardz_reply(messages: list) -> str:
         "scanning, in one multi-tenant console. Free Community tier; Pro and Ultimate per-user/mo "
         "(Ultimate includes SentinelOne MDR); no enterprise commitment. 2025 MSP Today Product of the "
         "Year; $56M Series B. Partners typically add it at $5-15/user on existing contracts.\n\n"
+        f"{collect_block}"
         "If asked, you're the Guardz AI assistant for Rain Networks (don't claim to be human). "
         "Output ONLY your next reply.\n\n"
         f"CONVERSATION:\n{convo if convo else '(the visitor just opened the chat — greet them warmly and ask what brought them in)'}"
@@ -1530,6 +1621,72 @@ async def _guardz_capture(sid: str):
             f"<h3>New Guardz-page chat lead</h3><p><b>Email:</b> {_h.escape(email)}</p><hr>{lines}</div>")
     ok, detail = await send_email(SALES_TEAM_EMAIL, f"🌐 Guardz page lead — {email}", body)
     print(f"[guardz-chat] lead {email} -> {SALES_TEAM_EMAIL}: ok={ok} ({detail})")
+
+
+async def _extract_contact(messages: list) -> dict:
+    """Pull name / company / phone / email from the visitor's messages. Regex handles
+    phone + email; a cheap, zero-temperature LLM pass handles name + company. Any field
+    the visitor hasn't clearly provided comes back as ''."""
+    visitor = "\n".join(m.get("text", "") for m in messages if m.get("role") == "customer")
+    alltext = _transcript_text(messages)
+    phone = _extract_phone(visitor, alltext)
+    email = _extract_email(visitor, alltext)
+    name, company = "", ""
+    if OPENROUTER_API_KEY and visitor.strip():
+        import httpx, json as _json
+        prompt = (
+            "Extract the visitor's full name and company from this chat. "
+            'Return ONLY compact JSON: {"name": "", "company": ""}. '
+            "Use an empty string for anything the visitor has not clearly stated. Do not guess.\n\n"
+            f"CHAT:\n{visitor[:2000]}"
+        )
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                             "HTTP-Referer": "https://interactivechat.up.railway.app",
+                             "X-Title": "Rain Networks Guardz"},
+                    json={"model": OPENROUTER_MODEL,
+                          "messages": [{"role": "user", "content": prompt}],
+                          "max_tokens": 80, "temperature": 0.0},
+                )
+            if resp.status_code == 200:
+                raw = resp.json()["choices"][0]["message"]["content"].strip()
+                raw = raw[raw.find("{"): raw.rfind("}") + 1] if "{" in raw else "{}"
+                data = _json.loads(raw or "{}")
+                name = (data.get("name") or "").strip()
+                company = (data.get("company") or "").strip()
+        except Exception as e:
+            print(f"[extract-contact] {e}")
+    return {"name": name, "company": company, "phone": phone, "email": email}
+
+
+async def _post_after_hours_lead(sid: str):
+    """While the AI is handling a chat, once it has the visitor's name, company, phone,
+    AND email, post the lead to the Zoom group chat (once) so the team can follow up."""
+    chat = _chats.get(sid)
+    if not chat:
+        return
+    st = _handoff_state.setdefault(sid, {})
+    if st.get("ah_lead_posted"):
+        return
+    c = await _extract_contact(chat.get("messages", []))
+    if not (c["name"] and c["company"] and c["phone"] and c["email"]):
+        return  # keep waiting until all four fields are in
+    st["ah_lead_posted"] = True
+    last = next((m["text"] for m in reversed(chat["messages"]) if m.get("role") == "customer"), "")
+    body = (f"Name: {c['name']}\n"
+            f"Company: {c['company']}\n"
+            f"Phone: {c['phone']}\n"
+            f"Email: {c['email']}\n\n"
+            f"Captured by the AI while the team was offline. Last message:\n> {last[:200]}")
+    await _post_zoom("🌙 After-hours lead captured", body, tag="after-hours-lead")
+    await _save_lead(session_id=sid, name=c["name"], company=c["company"],
+                     email=c["email"], phone=c["phone"], vertical="",
+                     signal="after_hours_ai_capture", handed_off=False,
+                     brief="", transcript=chat.get("messages", []))
+    print(f"[after-hours-lead] posted lead for {c['name']} @ {c['company']}")
 
 
 @app.post("/guardz/chat")
@@ -1840,7 +1997,7 @@ COPILOT_PAGE = """<!DOCTYPE html>
    <div class="sec"><div class="sec-l">Intent</div><div id="intent" class="lt">&mdash;</div><div class="bar"><i id="intentbar"></i></div></div>
    <div class="sec"><div class="sec-l">Tone / intent read</div><div class="tone" id="tone">Waiting for the customer...</div></div>
    <div class="sec"><div class="sec-l">Coaching nudge</div><div class="sug" id="sug">&mdash;</div></div>
-   <div class="sec"><div class="sec-l" style="color:#374151">Coaching also posts to Slack when SLACK_WEBHOOK_URL is set.</div></div>
+   <div class="sec"><div class="sec-l" style="color:#374151">Coaching also posts to Zoom when ZOOM_WEBHOOK_URL is set.</div></div>
  </div>
 </div>
 <script>
