@@ -1511,6 +1511,98 @@ async def chat_state(session_id: str = "copilot"):
     return {"messages": chat.get("messages", []), "coach": chat.get("coach", {}), "mode": mode}
 
 
+# ─── Shared reps' inbox: every live chat in one place, claim + answer ──────────
+REP_KEY = os.getenv("REP_KEY", "")   # optional gate; if set, /inbox + /chat/sessions need ?key=
+
+def _mode_of(chat):
+    if chat.get("human_active"): return "human"
+    if chat.get("ai_active"): return "ai"
+    if chat.get("team_pinged"): return "waiting"
+    return "idle"
+
+@app.get("/chat/sessions")
+async def chat_sessions(key: str = ""):
+    if REP_KEY and key != REP_KEY:
+        raise HTTPException(status_code=401, detail="bad key")
+    out = []
+    for sid, chat in _chats.items():
+        msgs = chat.get("messages", [])
+        if not msgs:
+            continue
+        last = next((m for m in reversed(msgs) if m.get("role") == "customer"), msgs[-1])
+        coach = chat.get("coach", {}) or {}
+        out.append({
+            "session_id": sid,
+            "last": (last.get("text", "") or "")[:140],
+            "mode": _mode_of(chat),
+            "count": len(msgs),
+            "updated": msgs[-1].get("ts", ""),
+            "health": coach.get("health"),
+            "intent": coach.get("intent"),
+        })
+    out.sort(key=lambda x: x.get("updated", ""), reverse=True)
+    return {"sessions": out}
+
+@app.get("/inbox", response_class=HTMLResponse)
+async def inbox_page():
+    return '''<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Reps Inbox &middot; Rain Networks</title>
+<style>
+ *{box-sizing:border-box;margin:0;padding:0}
+ body{background:#0b0c14;color:#e8ecf3;font:14px/1.5 system-ui,Segoe UI,Roboto,sans-serif}
+ header{display:flex;align-items:center;gap:14px;padding:16px 22px;border-bottom:1px solid #1e2233;background:#0e1120;position:sticky;top:0;z-index:5}
+ header h1{font-size:16px;font-weight:600}
+ .wc{margin-left:auto;font-size:13px;color:#9aa4b8}.wc b{color:#f5c451}
+ .wrap{max-width:920px;margin:0 auto;padding:18px 20px 70px}
+ .legend{display:flex;gap:16px;font-size:12px;color:#7b86a0;margin-bottom:14px;flex-wrap:wrap}
+ .row{display:flex;align-items:center;gap:14px;background:#121623;border:1px solid #1e2233;border-radius:12px;padding:14px 16px;margin-bottom:10px}
+ .row.waiting{border-color:#5a4a1f;background:#191610;animation:pulse 1.6s infinite}
+ @keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(245,196,81,0)}50%{box-shadow:0 0 0 3px rgba(245,196,81,.18)}}
+ .pill{font-size:11px;font-weight:700;border-radius:999px;padding:4px 10px;white-space:nowrap;text-transform:uppercase;letter-spacing:.04em}
+ .pill.waiting{background:#3a2f12;color:#f5c451}.pill.human{background:#12331f;color:#7ee0b4}
+ .pill.ai{background:#1a2540;color:#8fb3ff}.pill.idle{background:#22262f;color:#8a93a5}
+ .msg{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#cdd4e0}
+ .meta{font-size:12px;color:#7b86a0;white-space:nowrap}
+ .dot{width:9px;height:9px;border-radius:50%;display:inline-block;margin-right:6px;vertical-align:middle}
+ .g{background:#10b981}.y{background:#f59e0b}.r{background:#ef4444}
+ .open{background:#2f6fe0;color:#fff;border:0;border-radius:8px;padding:8px 14px;font-weight:600;cursor:pointer;text-decoration:none;font-size:13px;white-space:nowrap}
+ .empty{color:#7b86a0;text-align:center;padding:50px;border:1px dashed #1e2233;border-radius:12px}
+</style></head><body>
+<header><h1>Rain Networks &middot; Reps Inbox</h1><span class="wc" id="wc"></span></header>
+<div class="wrap">
+ <div class="legend"><span>&#128993; waiting = grab it</span><span>&#128994; human = a rep has it</span><span>&#128309; ai = AI covering</span><span style="margin-left:auto">refreshes every 2.5s</span></div>
+ <div id="list"><div class="empty">Loading live chats&hellip;</div></div>
+</div>
+<script>
+ var KEY=new URLSearchParams(location.search).get('key')||'';
+ function esc(s){var d=document.createElement('div');d.textContent=(s==null?'':s);return d.innerHTML;}
+ function hdot(h){var c=(h==='green'?'g':h==='yellow'?'y':h==='red'?'r':'');return c?'<span class="dot '+c+'"></span>':'';}
+ function render(sessions){
+   var order={waiting:0,human:1,ai:2,idle:3};
+   sessions.sort(function(a,b){return (order[a.mode]-order[b.mode])||(a.updated<b.updated?1:-1);});
+   var waiting=sessions.filter(function(s){return s.mode==='waiting';}).length;
+   document.getElementById('wc').innerHTML=waiting?('<b>'+waiting+'</b> waiting for a rep'):(sessions.length?'All chats covered':'');
+   var list=document.getElementById('list');
+   if(!sessions.length){list.innerHTML='<div class="empty">No live chats right now. New ones appear here automatically.</div>';return;}
+   list.innerHTML=sessions.map(function(s){
+     var intent=(s.intent!=null?('intent '+s.intent+'% &middot; '):'');
+     var link='/agent?session='+encodeURIComponent(s.session_id);
+     return '<div class="row '+s.mode+'"><span class="pill '+s.mode+'">'+s.mode+'</span>'
+       +'<span class="msg">'+hdot(s.health)+esc(s.last||'(no message yet)')+'</span>'
+       +'<span class="meta">'+intent+s.count+' msgs</span>'
+       +'<a class="open" href="'+link+'" target="_blank">Open &rarr;</a></div>';
+   }).join('');
+ }
+ function poll(){
+   fetch('/chat/sessions'+(KEY?('?key='+encodeURIComponent(KEY)):''))
+     .then(function(r){if(!r.ok)throw 0;return r.json();})
+     .then(function(d){render(d.sessions||[]);})
+     .catch(function(){document.getElementById('list').innerHTML='<div class="empty">Could not load. Check your inbox link/key.</div>';});
+ }
+ poll();setInterval(poll,2500);
+</script></body></html>'''
+
+
 @app.get("/chat/reset")
 async def chat_reset(session_id: str = "copilot"):
     _chats.pop(session_id, None)
